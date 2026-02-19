@@ -1,0 +1,33 @@
+{
+  "name": "rag-services",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@babel/parser": "^7.29.0",
+    "@babel/traverse": "^7.29.0",
+    "@google/genai": "^1.40.0",
+    "@huggingface/inference": "^4.13.11",
+    "@langchain/community": "^1.1.11",
+    "@langchain/core": "^1.1.19",
+    "@langchain/google-genai": "^2.1.15",
+    "@langchain/textsplitters": "^1.0.1",
+    "@octokit/app": "^13.1.8",
+    "@octokit/request": "^10.0.7",
+    "@pinecone-database/pinecone": "^6.1.0",
+    "dotenv": "^16.6.1",
+    "drizzle-orm": "^0.45.1",
+    "express": "^5.2.1",
+    "langchain": "^1.2.17",
+    "parse-diff": "^0.11.1",
+    "pg": "^8.18.0"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.9"
+  }
+}

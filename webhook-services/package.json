@@ -1,0 +1,19 @@
+{
+  "name": "githubcodereview",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@octokit/app": "^13.1.8",
+    "body-parser": "^2.2.2",
+    "crypto": "^1.0.1",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "octokit": "^5.0.5"
+  }
+}
