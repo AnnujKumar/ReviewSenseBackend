@@ -1,0 +1,111 @@
+@startuml GraphRAG_Ingestion_Pipeline
+
+!theme cerulean
+skinparam backgroundColor #FEFEFE
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam shadowing true
+skinparam roundCorner 10
+
+skinparam rectangle {
+    BorderColor #4A6FA5
+    BackgroundColor #FFFFFF
+}
+
+skinparam arrow {
+    Color #4A6FA5
+    FontColor #555555
+    FontSize 10
+}
+
+title <size:18><b>GraphRAG Code Reviewer — Three-Phase Ingestion Pipeline</b></size>\n<size:12><color:#666666>Repository Installation → AST Parse → Graph Build → Vector Embed</color></size>
+
+|#E8F0FE| **GitHub** |
+start
+:User installs **GitHub App**\non repository;
+:GitHub sends **installation**\nwebhook event;
+
+|#F5F0FF| **Webhook Service** |
+:Verify signature;
+:Enqueue to **ingestion-queue**;
+
+|#FFF8E7| **Message Queue** |
+:Job picked up by\n**Ingestion Worker**;
+
+|#F0FFF0| **RAG Service** |
+
+:Authenticate as GitHub App\n(JWT → Installation Token);
+:Create/verify DB records:\n**User → Installation → Repository**;
+
+partition "**Step 1: Repository Fetch**" #E0F0FF {
+    :Fetch **repo tree** via\nGitHub Trees API;
+    :Filter files:\n.js | .jsx | .ts | .tsx | .mjs | .cjs;
+    :Download each file's\n**blob content** (base64 decode);
+}
+
+partition "**Phase 1: AST Parsing**  (per file)" #E5F5E5 {
+    :Parse code into **AST**\nusing @babel/parser\n(JSX + TypeScript plugins);
+    :Traverse AST to extract\n**Symbols**;
+    note right
+        Types extracted:
+        • FunctionDeclaration
+        • ClassDeclaration
+        • ClassMethod
+        • ArrowFunctionExpression
+        • FunctionExpression
+        
+        Data captured:
+        name, type, startLine,
+        endLine, source code
+    end note
+    :Traverse AST to extract\n**Dependencies**;
+    note right
+        Types extracted:
+        • CallExpression → "calls"
+        • ImportDeclaration → "imports"
+        • require() → "imports"
+        
+        Uses **Symbol Stack**
+        for nested scope
+    end note
+}
+
+partition "**Phase 2: Graph Construction**  (per file)" #FFF5E5 {
+    :Insert **symbols** into\nNeon PostgreSQL\n(ON CONFLICT DO NOTHING);
+    note right
+        symbols table:
+        repositoryId, filePath,
+        symbolName, symbolType,
+        startLine, endLine
+    end note
+    :Resolve dependency targets\nto **symbol IDs**;
+    :Insert **edges** into\nNeon PostgreSQL;
+    note right
+        edges table:
+        fromSymbolId → toSymbolId
+        edgeType: "calls" | "imports"
+        
+        Two-phase: symbols first,
+        edges second (no orphans)
+    end note
+}
+
+partition "**Phase 3: Vector Embedding**  (per file)" #F5E5F5 {
+    :Generate **768-dim embeddings**\nfor each symbol via\nHuggingFace all-mpnet-base-v2;
+    :Prepare vectors with **metadata**:\nrepo, path, symbolName,\nsymbolType, startLine,\nendLine, code text;
+    :Batch upsert to **Pinecone**\n(50 vectors per batch);
+}
+
+:Mark repository as\n**isIndexed = true**;
+stop
+
+legend bottom right
+    |= Phase |= Storage Target |= Key Technology |
+    | AST Parsing | In-memory | @babel/parser + traverse |
+    | Graph Construction | Neon PostgreSQL | Drizzle ORM |
+    | Vector Embedding | Pinecone | HuggingFace + Pinecone SDK |
+endlegend
+
+footer <size:10><i>GraphRAG Code Reviewer — Repository Ingestion Pipeline</i></size>
+
+@enduml

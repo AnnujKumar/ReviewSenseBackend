@@ -1,0 +1,256 @@
+@startuml GraphRAG_Code_Review_Architecture
+
+!theme cerulean
+skinparam backgroundColor #FEFEFE
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam shadowing true
+skinparam roundCorner 12
+skinparam linetype ortho
+
+skinparam rectangle {
+    BorderColor #4A6FA5
+    BackgroundColor #FFFFFF
+    FontColor #1A1A1A
+    StereotypeFontSize 10
+}
+
+skinparam node {
+    BorderColor #4A6FA5
+    BackgroundColor #EDF2F7
+}
+
+skinparam database {
+    BorderColor #2D5F8A
+    BackgroundColor #E8F4FD
+    FontColor #1B3A5C
+}
+
+skinparam queue {
+    BorderColor #D4A843
+    BackgroundColor #FFF8E7
+    FontColor #7A5A00
+}
+
+skinparam cloud {
+    BorderColor #5B9BD5
+    BackgroundColor #F0F7FF
+    FontColor #1B3A5C
+}
+
+skinparam component {
+    BorderColor #4A6FA5
+    BackgroundColor #FFFFFF
+}
+
+skinparam arrow {
+    Color #4A6FA5
+    FontColor #555555
+    FontSize 10
+}
+
+title <size:20><b>GraphRAG Code Reviewer</b></size>\n<size:14><color:#555555>System Architecture — AI-Powered Pull Request Analysis with Impact-Aware Dependency Traversal</color></size>
+
+' ═══════════════════════════════════════════════════════════════
+'  GITHUB PLATFORM
+' ═══════════════════════════════════════════════════════════════
+
+cloud "**GitHub Platform**" as github #E8F0FE {
+    rectangle "Pull Request\nEvents" as pr_event <<opened / reopened / sync>> #C8DBFC
+    rectangle "Push Events\n(default branch)" as push_event <<added / modified / removed>> #C8DBFC
+    rectangle "Installation\nEvents" as install_event <<created / added>> #C8DBFC
+    rectangle "GitHub REST\nAPI v3" as gh_api <<Octokit SDK>> #DAE5F5
+}
+
+' ═══════════════════════════════════════════════════════════════
+'  WEBHOOK SERVICE (Microservice 1)
+' ═══════════════════════════════════════════════════════════════
+
+package "**Webhook Service**  //Node.js + Express//  Port 3000" as webhook_svc #F5F0FF {
+
+    rectangle "HMAC SHA-256\nSignature Verifier" as sig_verify <<crypto>> #E8E0F5
+
+    rectangle "Event Router" as event_router #F0EBF8 {
+        rectangle "PR Handler" as pr_handler #DDD5F0
+        rectangle "Push Handler" as push_handler #DDD5F0
+        rectangle "Install Handler" as install_handler #DDD5F0
+    }
+
+    component "GitHub Services" as gh_services <<gitHubServices.js>> #E8E0F5 {
+        rectangle "getPullRequestDiff()" as get_diff #DDD5F0
+        rectangle "postPRComment()" as post_comment #DDD5F0
+    }
+}
+
+' ═══════════════════════════════════════════════════════════════
+'  MESSAGE QUEUES (Redis / BullMQ)
+' ═══════════════════════════════════════════════════════════════
+
+package "**Message Broker**  //Redis via Upstash (TLS)//" as mq_layer #FFF8E7 {
+    queue "review-queue\n<size:9>concurrency: 2 | retries: 3\nbackoff: exponential (5s)</size>" as review_q #FFE9A8
+    queue "update-queue\n<size:9>concurrency: 1</size>" as update_q #FFE9A8
+    queue "ingestion-queue\n<size:9>concurrency: 1</size>" as ingestion_q #FFE9A8
+}
+
+' ═══════════════════════════════════════════════════════════════
+'  RAG SERVICE (Microservice 2)
+' ═══════════════════════════════════════════════════════════════
+
+package "**RAG Service**  //Node.js + Express//  Port 3000" as rag_svc #F0FFF0 {
+
+    rectangle "**BullMQ Workers**" as workers #E0F5E0 {
+        rectangle "Ingestion Worker\n<size:9>Full repo AST parse\n+ graph + embed</size>" as ingest_worker #C8E6C8
+        rectangle "Update Worker\n<size:9>Incremental delete\n+ re-ingest</size>" as update_worker #C8E6C8
+        rectangle "Review Worker (x2)\n<size:9>Diff parse + impact\nretrieval + LLM review</size>" as review_worker #C8E6C8
+    }
+
+    rectangle "**Service Layer**" as services #E5F5E5 {
+
+        component "Embedding Service\n<size:9>embeddingService.js</size>" as embed_svc #D5ECD5 {
+            rectangle "Babel AST Parser\n<size:9>@babel/parser + traverse\nJSX & TypeScript plugins</size>" as ast_parser #C0DFC0
+            rectangle "Symbol Extractor\n<size:9>Function | Class | Method\nArrow | Expression</size>" as sym_extract #C0DFC0
+            rectangle "Dependency Extractor\n<size:9>CallExpression | Import\nRequire | Symbol Stack</size>" as dep_extract #C0DFC0
+            rectangle "Vector Embedder\n<size:9>HuggingFace all-mpnet-base-v2\n768-dim | batch=50</size>" as embedder #C0DFC0
+        }
+
+        component "Graph Service\n<size:9>graphService.js</size>" as graph_svc #D5ECD5 {
+            rectangle "insertFileSymbols()\n<size:9>Phase 1: Nodes first</size>" as insert_sym #C0DFC0
+            rectangle "insertFileEdges()\n<size:9>Phase 2: Edges after</size>" as insert_edge #C0DFC0
+            rectangle "deleteGraphForFile()\n<size:9>CASCADE via FK</size>" as delete_graph #C0DFC0
+        }
+
+        component "Retrieval Service\n<size:9>retrievalService.js</size>" as retrieval_svc #D5ECD5 {
+            rectangle "extractChangedRanges()\n<size:9>Diff → Old-file coords</size>" as extract_ranges #C0DFC0
+            rectangle "getImpactedSymbols()\n<size:9>Overlap: Start≤End ∧ End≥Start</size>" as get_impact #C0DFC0
+            rectangle "expandImpact()\n<size:9>Graph traversal via edges</size>" as expand_impact #C0DFC0
+            rectangle "fetchSymbolsFromPinecone()\n<size:9>Code context retrieval</size>" as fetch_pinecone #C0DFC0
+        }
+
+        component "Ingestion Service\n<size:9>ingestionServices.js</size>" as ingest_svc #D5ECD5 {
+            rectangle "ingestRepo()\n<size:9>Tree fetch → filter\n.js .ts .jsx .tsx .mjs .cjs</size>" as ingest_repo #C0DFC0
+        }
+
+        component "Update Service\n<size:9>updationServices.js</size>" as update_svc #D5ECD5 {
+            rectangle "updateRepoFiles()\n<size:9>Delete-then-insert\nmodified + removed</size>" as update_repo #C0DFC0
+        }
+
+        component "LLM Service\n<size:9>llmService.js</size>" as llm_svc #D5ECD5 {
+            rectangle "generatePRReview()\n<size:9>Temp: 0.1 | Role: Sr. Principal\nCritical 🔴 | Suggest 🟡 | Good 🟢</size>" as gen_review #C0DFC0
+            rectangle "generateAnswer()\n<size:9>Temp: 0.2 | Role: Principal\nRAG-grounded Q&A</size>" as gen_answer #C0DFC0
+        }
+    }
+
+    rectangle "**HTTP API**" as http_api #E0F5E0 {
+        rectangle "POST /query\n<size:9>X-API-Key auth\nSemantic codebase Q&A</size>" as query_api #C8E6C8
+    }
+}
+
+' ═══════════════════════════════════════════════════════════════
+'  EXTERNAL DATABASES & AI SERVICES
+' ═══════════════════════════════════════════════════════════════
+
+package "**Data & AI Layer**" as data_layer #FFF5F5 {
+
+    database "**Neon PostgreSQL**\n<size:9>Serverless | SSL | Drizzle ORM</size>" as neon_db #E8F4FD {
+        rectangle "users" as t_users #D0E8F8
+        rectangle "installations" as t_installs #D0E8F8
+        rectangle "repositories" as t_repos #D0E8F8
+        rectangle "symbols\n<size:9>(Graph Nodes)</size>" as t_symbols #B8D8F0
+        rectangle "edges\n<size:9>(Graph Edges)</size>" as t_edges #B8D8F0
+    }
+
+    database "**Pinecone Vector DB**\n<size:9>Index: code-review-index\nDim: 768 | Metric: Cosine</size>" as pinecone_db #E8F4FD {
+        rectangle "Symbol Embeddings\n<size:9>Metadata: repo, path,\nsymbolName, type, code</size>" as vectors #D0E8F8
+    }
+
+    rectangle "**Google GenAI**\n<size:9>Model: gemma-3-12b-it\n12B params | Instruction-tuned</size>" as gemini #FDE8E8
+
+    rectangle "**HuggingFace API**\n<size:9>sentence-transformers/\nall-mpnet-base-v2</size>" as hf_api #FDE8E8
+}
+
+' ═══════════════════════════════════════════════════════════════
+'  CONNECTIONS — GitHub → Webhook Service
+' ═══════════════════════════════════════════════════════════════
+
+pr_event -down-> sig_verify : "Webhook\nPayload"
+push_event -down-> sig_verify
+install_event -down-> sig_verify
+
+sig_verify -down-> event_router
+
+pr_handler -[hidden]right-> push_handler
+push_handler -[hidden]right-> install_handler
+
+' ═══════════════════════════════════════════════════════════════
+'  CONNECTIONS — Webhook → Queues
+' ═══════════════════════════════════════════════════════════════
+
+pr_handler -down-> review_q : "diff, title,\ndesc, PR#"
+push_handler -down-> update_q : "modified[],\nremoved[]"
+install_handler -down-> ingestion_q : "owner, repo,\ninstallId"
+
+' ═══════════════════════════════════════════════════════════════
+'  CONNECTIONS — Queues → Workers
+' ═══════════════════════════════════════════════════════════════
+
+review_q -down-> review_worker
+update_q -down-> update_worker
+ingestion_q -down-> ingest_worker
+
+' ═══════════════════════════════════════════════════════════════
+'  CONNECTIONS — Workers → Services
+' ═══════════════════════════════════════════════════════════════
+
+ingest_worker -down-> ingest_svc
+ingest_worker -down-> embed_svc
+update_worker -down-> update_svc
+review_worker -down-> retrieval_svc
+review_worker -down-> llm_svc
+
+' ═══════════════════════════════════════════════════════════════
+'  CONNECTIONS — Services → Databases / AI
+' ═══════════════════════════════════════════════════════════════
+
+graph_svc -down-> neon_db : "  Symbols\n  + Edges  "
+retrieval_svc -down-> neon_db : "  Overlap\n  Query  "
+retrieval_svc -down-> pinecone_db : "  Fetch Code\n  Context  "
+embed_svc -down-> pinecone_db : "  Upsert\n  Vectors  "
+embed_svc -down-> hf_api : "  Generate\n  Embeddings  "
+ingest_svc -right-> gh_api : "  Fetch\n  Files  "
+llm_svc -down-> gemini : "  Generate\n  Review / Answer  "
+query_api -left-> retrieval_svc
+query_api -down-> llm_svc
+
+' ═══════════════════════════════════════════════════════════════
+'  CONNECTIONS — Review back to GitHub
+' ═══════════════════════════════════════════════════════════════
+
+review_worker -up-> post_comment : "Post review\ncomment"
+post_comment -up-> gh_api : "PR Comment"
+
+' ═══════════════════════════════════════════════════════════════
+'  INTERNAL SERVICE DEPENDENCIES
+' ═══════════════════════════════════════════════════════════════
+
+embed_svc -right-> graph_svc : "Store\ngraph"
+update_svc -left-> embed_svc : "Re-ingest\nfiles"
+update_svc -down-> graph_svc : "Delete old\ngraph"
+
+' ═══════════════════════════════════════════════════════════════
+'  LEGEND
+' ═══════════════════════════════════════════════════════════════
+
+legend bottom right
+  |= Color |= Component |
+  |<#C8DBFC> | GitHub Platform |
+  |<#DDD5F0> | Webhook Service |
+  |<#FFE9A8> | Message Queues (BullMQ / Redis) |
+  |<#C8E6C8> | RAG Service Workers |
+  |<#C0DFC0> | RAG Service Layer |
+  |<#D0E8F8> | Databases (Neon / Pinecone) |
+  |<#FDE8E8> | AI Services (GenAI / HuggingFace) |
+endlegend
+
+footer <size:10><i>GraphRAG Code Reviewer — System Architecture Diagram</i></size>
+
+@enduml

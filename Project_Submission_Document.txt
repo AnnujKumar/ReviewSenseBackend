@@ -1,0 +1,745 @@
+================================================================================
+                          PROJECT SUBMISSION DOCUMENT
+================================================================================
+
+
+================================================================================
+1. PROJECT TITLE
+================================================================================
+
+Graph-Augmented Retrieval-Based Intelligent Code Review System Using
+AST-Driven Dependency Analysis and Large Language Models
+
+Short Title: GraphRAG Code Reviewer — An AI-Powered Pull Request Analysis 
+Engine with Impact-Aware Dependency Traversal
+
+
+================================================================================
+2. ABSTRACT
+================================================================================
+
+Modern software development teams rely heavily on code reviews to maintain
+quality, yet manual reviews are time-consuming, inconsistent, and often miss
+subtle integration-level defects that span multiple files. This project presents
+a novel automated code review system that combines Retrieval-Augmented
+Generation (RAG) with graph-based dependency analysis to deliver
+context-aware, impact-sensitive pull request reviews.
+
+The system operates as a GitHub App that listens for webhook events (pull 
+requests, pushes, and installations). Upon repository installation, the 
+entire codebase is ingested through a three-phase pipeline: (1) Abstract 
+Syntax Tree (AST) parsing via Babel to extract function-level symbols and 
+their call dependencies, (2) construction of a code dependency graph stored 
+in a PostgreSQL database (Neon), and (3) generation of semantic embeddings 
+for each symbol using HuggingFace's sentence-transformers/all-mpnet-base-v2 
+model, stored in a Pinecone vector database.
+
+When a pull request is opened, the system parses the Git diff to identify 
+changed line ranges, maps these ranges to affected code symbols using an 
+overlap detection algorithm against the stored graph, expands the impact 
+radius through graph traversal to find downstream dependent functions, and 
+retrieves their source code from the vector store. This combined context — 
+the diff itself plus the impacted downstream code — is fed to a Google 
+Gemini LLM (Gemma 3 12B Instruction-Tuned) with a carefully engineered 
+prompt that instructs it to detect logical regressions, breaking API 
+changes, and integration-level defects.
+
+Early results demonstrate the system's ability to identify breaking changes 
+that conventional line-by-line review tools miss — specifically, cases where 
+a function signature changes but its callers in other files remain 
+unmodified. The system also supports a conversational RAG query endpoint 
+for semantic codebase exploration.
+
+Key contributions include: (i) a symbol-level embedding strategy that 
+replaces naive text chunking with AST-driven code decomposition, (ii) a 
+diff-to-graph impact retrieval mechanism that maps PR changes to 
+downstream dependencies before LLM analysis, and (iii) a microservice 
+architecture with asynchronous job processing via BullMQ for production-
+grade scalability.
+
+
+================================================================================
+3. INTRODUCTION
+================================================================================
+
+3.1 Problem Statement
+---------------------
+Code review is a critical quality assurance practice in software engineering. 
+However, it faces several persistent challenges:
+
+  (a) Manual reviews are time-intensive and inconsistent across reviewers.
+  (b) Existing automated tools (linters, static analyzers) operate at the 
+      syntactic level and cannot reason about cross-file logical impact.
+  (c) AI-based review tools that use Large Language Models (LLMs) typically 
+      provide the model with only the diff text, lacking the broader context 
+      of how changes affect the rest of the codebase.
+  (d) No widely available tool combines code dependency graph analysis with 
+      semantic retrieval and LLM reasoning in a unified review pipeline.
+
+3.2 Motivation
+--------------
+Consider a common scenario: a developer changes the signature of a utility 
+function — perhaps adding a required parameter or altering its return type. 
+The diff looks correct in isolation. A standard AI reviewer, seeing only 
+the diff, would approve it. However, 15 other functions across the codebase 
+call this utility, and none of them have been updated. This is an 
+integration-level regression that only becomes visible when you understand 
+the dependency graph.
+
+This project is motivated by the need to bridge this gap: to build a 
+review system that understands not just what changed, but what else in the 
+codebase depends on what changed, and whether those dependencies will break.
+
+3.3 Domain Connection
+---------------------
+This work sits at the intersection of:
+  - Software Engineering (automated code review, static analysis)
+  - Natural Language Processing (retrieval-augmented generation)
+  - Graph Theory (dependency graph construction and traversal)
+  - DevOps / CI-CD (GitHub App integration, webhook-driven automation)
+
+3.4 Objectives
+--------------
+  (a) Design and implement a GitHub-integrated automated code review system 
+      that goes beyond surface-level analysis.
+  (b) Construct a code dependency graph from AST analysis and use it to 
+      determine the impact radius of pull request changes.
+  (c) Combine graph-based impact retrieval with vector-based semantic search 
+      and LLM-powered reasoning to produce high-quality reviews.
+  (d) Provide a scalable, event-driven architecture suitable for real-world 
+      deployment using message queues and microservices.
+  (e) Support conversational codebase querying via a RAG-powered API endpoint.
+
+
+================================================================================
+4. BACKGROUND STUDY
+================================================================================
+
+4.1 Abstract Syntax Trees (AST)
+-------------------------------
+An AST is a tree representation of the syntactic structure of source code. 
+Each node in the tree corresponds to a construct in the source language (e.g., 
+a function declaration, a variable assignment, a class definition). By parsing 
+code into an AST, we can programmatically extract structured information such 
+as function names, parameter signatures, line ranges, and call relationships 
+without relying on fragile text-based pattern matching. In this project, the 
+Babel parser is used to generate ASTs for JavaScript and TypeScript files, 
+and Babel's traverse utility walks the tree to extract symbols (functions, 
+classes, methods) and dependencies (function calls, imports).
+
+4.2 Retrieval-Augmented Generation (RAG)
+-----------------------------------------
+RAG is a paradigm that augments LLM prompts with externally retrieved 
+context before generation. Instead of relying solely on the model's 
+parametric memory (which can hallucinate), RAG retrieves relevant documents 
+or code snippets from a knowledge base and injects them into the prompt. 
+This grounds the model's output in factual, up-to-date information. Our 
+system uses RAG twice: once for the code query endpoint (semantic search + 
+answer generation) and once for PR reviews (graph-based impact retrieval + 
+review generation).
+
+4.3 Vector Databases and Semantic Embeddings
+---------------------------------------------
+Semantic embeddings are dense numerical vectors that capture the meaning of 
+text (or code). Similar code fragments produce vectors that are close 
+together in the embedding space. A vector database like Pinecone stores 
+these embeddings and enables efficient similarity search via approximate 
+nearest neighbor algorithms. In this project, each code symbol (function, 
+class, method) is embedded using the sentence-transformers/all-mpnet-base-v2 
+model (768-dimensional) and stored in Pinecone with rich metadata (file 
+path, symbol name, type, line range, source code).
+
+4.4 Code Dependency Graphs
+--------------------------
+A code dependency graph models relationships between code entities. Nodes 
+represent symbols (functions, classes, methods), and edges represent 
+dependencies (function calls, module imports). By constructing this graph, 
+we can answer questions like "Which functions call function X?" or "If 
+function X changes, what else might break?" This project stores the 
+dependency graph in a PostgreSQL (Neon) database as two tables: symbols 
+(nodes) and edges (directed dependencies).
+
+4.5 Large Language Models for Code Understanding
+--------------------------------------------------
+LLMs trained on code (such as Google's Gemma family) can reason about 
+programming logic, detect bugs, and generate natural language explanations 
+of code behavior. When provided with sufficient context — the diff, the 
+impacted downstream code, and clear instructions — these models can perform 
+high-quality code review that approaches the reasoning of a senior engineer.
+
+4.6 Message Queues and Asynchronous Processing
+-----------------------------------------------
+Message queues (such as BullMQ backed by Redis) enable decoupling of event 
+producers from event consumers. In a webhook-driven system, incoming events 
+can arrive in bursts and take variable time to process. By enqueuing events 
+and processing them asynchronously via dedicated workers, the system achieves 
+reliability (with retries and backoff), scalability (workers can be scaled 
+independently), and responsiveness (webhook endpoints return immediately).
+
+
+================================================================================
+5. LITERATURE SURVEY
+================================================================================
+
+5.1 Review of Related Work
+---------------------------
+
+[1] M. Tufano, C. Watson, G. Bavota, M. Di Penta, M. White, and 
+    D. Poshyvanyk, "An Empirical Study on Learning Bug-Fixing Patches in 
+    the Wild," in Proc. ACM/IEEE 40th Intl. Conf. on Software Engineering 
+    (ICSE), 2018, pp. 506-517.
+    
+    Summary: This work studied automated program repair by learning from 
+    historical bug-fixing commits. The approach treats bug fixing as a 
+    neural machine translation task (buggy code → fixed code).
+    
+    Gap: The system operates on isolated code fragments and does not 
+    consider inter-file dependencies or the broader impact of changes.
+
+[2] P. Lewis, E. Perez, A. Piktus, et al., "Retrieval-Augmented 
+    Generation for Knowledge-Intensive NLP Tasks," in Advances in Neural 
+    Information Processing Systems (NeurIPS), 2020.
+    
+    Summary: This foundational paper introduced the RAG paradigm, 
+    demonstrating that combining a retrieval component with a generative 
+    model significantly improves factual accuracy on knowledge-intensive 
+    tasks.
+    
+    Gap: The RAG framework was designed for natural language documents, 
+    not source code. Code has structural properties (ASTs, scopes, types) 
+    that pure text retrieval does not exploit.
+
+[3] Y. Li, D. Choi, J. Chung, et al., "Competition-Level Code 
+    Generation with AlphaCode," Science, vol. 378, no. 6624, pp. 
+    1092-1097, 2022.
+    
+    Summary: DeepMind's AlphaCode demonstrated that LLMs can generate 
+    competitive-level programming solutions when given problem descriptions 
+    and example test cases.
+    
+    Gap: The system generates code from scratch but does not review 
+    existing code or assess the impact of code changes on a live codebase.
+
+[4] S. Lu, D. Guo, S. Ren, et al., "CodeBERT: A Pre-Trained Model for 
+    Programming and Natural Languages," in Proc. Findings of EMNLP 2020, 
+    pp. 1536-1547.
+    
+    Summary: CodeBERT is a bimodal pre-trained model for both programming 
+    and natural languages, achieving strong performance on code search and 
+    documentation generation tasks.
+    
+    Gap: CodeBERT provides embeddings and classification but lacks the 
+    generative review capability and graph-based impact analysis that a 
+    full code review system requires.
+
+[5] A. Svyatkovskiy, S. K. Deng, S. Fu, and N. Sundaresan, 
+    "IntelliCode Compose: Code Generation Using Transformer," in Proc. 
+    ACM Joint European Software Engineering Conference and Symposium on 
+    the Foundations of Software Engineering (ESEC/FSE), 2020, pp. 
+    1433-1443.
+    
+    Summary: Microsoft's IntelliCode uses GPT-based transformers for 
+    multi-token code completion within IDEs, demonstrating practical LLM 
+    deployment for developers.
+    
+    Gap: Focused on code completion rather than review. Does not analyze 
+    the impact of code changes on the broader repository or generate 
+    structured review feedback.
+
+[6] R. Li, L. B. Allal, Y. Zi, et al., "StarCoder: May the Source Be 
+    with You," arXiv preprint arXiv:2305.06161, 2023.
+    
+    Summary: StarCoder is a 15B-parameter code-generation LLM trained on 
+    permissively licensed GitHub data, supporting 80+ languages with an 
+    8K context window.
+    
+    Gap: While powerful for code generation and infilling, StarCoder does 
+    not incorporate repository-level context, dependency graphs, or 
+    diff-aware analysis for code review.
+
+[7] C. S. Xia and L. Zhang, "Automated Program Repair via Conversation-
+    Driven LLMs," in Proc. ACM/IEEE 45th Intl. Conf. on Software 
+    Engineering (ICSE), 2023.
+    
+    Summary: This work uses conversational LLM interactions to iteratively 
+    refine program repair patches, achieving state-of-the-art results on 
+    standard benchmarks.
+    
+    Gap: Repair focus is on isolated bugs rather than holistic PR review. 
+    Does not construct or traverse dependency graphs to find integration-
+    level defects.
+
+[8] J. Austin, A. Odena, M. Nye, et al., "Program Synthesis with Large 
+    Language Models," arXiv preprint arXiv:2108.07732, 2021.
+    
+    Summary: Google's study on using LLMs for program synthesis from 
+    docstrings, establishing the HumanEval benchmark for evaluating code-
+    generation quality.
+    
+    Gap: Evaluation is limited to isolated function synthesis. Does not 
+    address the challenge of reviewing code changes within the context of 
+    a full repository and its dependency structure.
+
+5.2 Summary of Research Gaps
+-----------------------------
+The literature reveals that while significant progress has been made in 
+LLM-based code generation, completion, and repair, there remains a notable 
+gap in systems that:
+
+  (a) Combine structural code analysis (AST parsing, dependency graphs) 
+      with semantic retrieval (vector embeddings) and LLM reasoning for 
+      code review.
+  (b) Perform diff-aware impact analysis — mapping changed lines to 
+      affected symbols and their downstream dependents — before invoking 
+      the LLM.
+  (c) Operate as integrated GitHub-native applications with production-
+      grade architecture (webhooks, message queues, microservices).
+
+This project addresses all three gaps.
+
+
+================================================================================
+6. PROPOSED SYSTEM
+================================================================================
+
+6.1 Core Contribution
+---------------------
+This project proposes a novel Graph-Augmented RAG system for automated code 
+review that differs from existing solutions in three fundamental ways:
+
+  (a) SYMBOL-LEVEL EMBEDDINGS INSTEAD OF TEXT CHUNKS:
+      Conventional RAG systems split documents into fixed-size text chunks 
+      (e.g., 500 tokens). This leads to arbitrary boundaries that split 
+      functions in half or merge unrelated code. Our system uses AST 
+      parsing to decompose code into its natural structural units — 
+      functions, classes, and methods — and embeds each unit as a 
+      standalone vector. This preserves semantic coherence and enables 
+      precise retrieval.
+
+  (b) DIFF-TO-GRAPH IMPACT RETRIEVAL:
+      Rather than searching for "related code" using generic semantic 
+      similarity, our system follows a deterministic pipeline:
+      
+      Diff Text → Parse Changed Line Ranges → Map to AST Symbols (Overlap 
+      Detection) → Traverse Dependency Graph (Expand Impact) → Fetch 
+      Dependent Code from Vector Store
+      
+      This ensures the LLM receives not just the changes, but the exact 
+      downstream code that depends on those changes — enabling detection 
+      of breaking changes, signature mismatches, and logical regressions.
+
+  (c) DUAL-DATABASE ARCHITECTURE FOR GRAPH + SEMANTIC SEARCH:
+      The system uses PostgreSQL (Neon) to store the dependency graph 
+      (symbols and edges) for fast SQL-based traversal, and Pinecone to 
+      store semantic embeddings for efficient similarity search. This 
+      separation allows each database to be optimized for its specific 
+      access pattern.
+
+6.2 Workflow Overview
+---------------------
+The system operates in three distinct modes:
+
+  MODE 1 — REPOSITORY INGESTION (Triggered by GitHub App installation):
+    1. Fetch all JavaScript/TypeScript files from the repository via 
+       GitHub API tree endpoint.
+    2. Parse each file into an AST using Babel.
+    3. Extract symbols (functions, classes, methods, arrow functions) 
+       with their line ranges and source code.
+    4. Extract dependencies (function calls, imports/requires) with 
+       caller-callee relationships.
+    5. Store symbols and edges in Neon PostgreSQL (code dependency graph).
+    6. Generate 768-dimensional embeddings for each symbol using 
+       HuggingFace all-mpnet-base-v2.
+    7. Upload embeddings with metadata to Pinecone vector database.
+
+  MODE 2 — INCREMENTAL UPDATE (Triggered by push to default branch):
+    1. Identify modified and deleted files from the push event.
+    2. For deleted files: remove corresponding graph nodes and vectors.
+    3. For modified files: delete old data, re-ingest using the full 
+       three-phase pipeline (delete-then-insert for consistency).
+
+  MODE 3 — PULL REQUEST REVIEW (Triggered by PR open/reopen/sync):
+    1. Fetch the raw diff from GitHub API.
+    2. Parse the diff to extract changed file paths and line ranges 
+       (using OLD file coordinates to match the pre-PR database state).
+    3. Query the symbol table to find symbols overlapping the changed 
+       ranges (overlap formula: SymbolStart <= RangeEnd AND 
+       SymbolEnd >= RangeStart).
+    4. Expand the impact by traversing outgoing edges in the dependency 
+       graph (find all symbols that the changed symbols call).
+    5. Fetch source code of all impacted symbols from Pinecone.
+    6. Send the diff + impacted context to the LLM with a structured 
+       prompt requesting bug detection, impact analysis, and categorized 
+       review feedback (Critical / Suggestion / Commendation).
+    7. Post the generated review as a comment on the GitHub PR.
+
+  BONUS MODE — CODEBASE QUERYING (Triggered via API endpoint):
+    1. Accept a natural language query and repository identifier.
+    2. Embed the query and perform semantic search against Pinecone.
+    3. Retrieve top-k matching code symbols with their source code.
+    4. Generate a natural language answer using the LLM grounded in the 
+       retrieved context.
+
+6.3 Novelty Highlights
+-----------------------
+  - THREE-PHASE AST-DRIVEN RAG PIPELINE: Parse → Graph → Embed, ensuring 
+    every vector in the database corresponds to a meaningful code unit 
+    rather than an arbitrary text chunk.
+    
+  - OVERLAP-BASED DIFF-TO-SYMBOL MAPPING: Uses mathematical overlap 
+    detection between diff line ranges and stored symbol line ranges to 
+    precisely identify affected code entities.
+    
+  - DEPENDENCY GRAPH EXPANSION: After identifying directly affected 
+    symbols, the system follows outgoing call edges to find transitively 
+    impacted code — catching integration-level issues.
+    
+  - OLD-FILE COORDINATE ALIGNMENT: Diffs report changes using old-file 
+    line numbers. The system correctly maps these against the pre-PR 
+    database state, avoiding coordinate misalignment bugs.
+    
+  - CASCADING DELETE SAFETY: Leverages PostgreSQL foreign key constraints 
+    with CASCADE to ensure that deleting a symbol automatically removes 
+    all its associated edges, preventing orphaned graph data.
+    
+  - SYMBOL STACK FOR NESTED SCOPE: The AST traversal uses a stack-based 
+    approach to correctly handle nested functions, ensuring that inner 
+    function calls are attributed to the correct enclosing symbol.
+    
+  - DUAL-TEMPERATURE LLM STRATEGY: Uses temperature 0.2 for factual 
+    Q&A (moderate creativity for explanation) and temperature 0.1 for 
+    PR review (strict logical reasoning, minimal hallucination).
+    
+  - PRODUCTION-GRADE ASYNCHRONOUS ARCHITECTURE: BullMQ workers with 
+    configurable concurrency, exponential backoff retry, and job 
+    deduplication prevent duplicate processing of GitHub webhook retries.
+
+
+================================================================================
+7. SYSTEM ARCHITECTURE
+================================================================================
+
+7.1 High-Level Architecture Diagram (Text Representation)
+-----------------------------------------------------------
+
++====================================================================+
+|                        GITHUB PLATFORM                              |
+|  (Pull Requests, Push Events, App Install Events)                   |
++====================+===============================================+
+                     |
+                     | Webhook (HMAC SHA-256 verified)
+                     v
++====================================================================+
+|               WEBHOOK SERVICE (Node.js / Express)                   |
+|  +--------------------------------------------------------------+  |
+|  | Event Router                                                  |  |
+|  |   pull_request  --> Review Queue (BullMQ)                     |  |
+|  |   push          --> Update Queue (BullMQ)                     |  |
+|  |   installation  --> Ingestion Queue (BullMQ)                  |  |
+|  +--------------------------------------------------------------+  |
++====================+===============================================+
+                     |
+                     | Redis (Upstash TLS)
+                     v
++====================================================================+
+|                RAG SERVICE (Node.js / Express)                      |
+|  +--------------------------------------------------------------+  |
+|  |                   BullMQ Workers                              |  |
+|  |                                                               |  |
+|  |  +-----------------+  +----------------+  +----------------+  |  |
+|  |  | Ingestion       |  | Update         |  | Review         |  |  |
+|  |  | Worker          |  | Worker         |  | Worker (x2)    |  |  |
+|  |  | (Full repo      |  | (Incremental   |  | (PR analysis   |  |  |
+|  |  |  AST parse +    |  |  delete +      |  |  + LLM review) |  |  |
+|  |  |  graph + embed) |  |  re-ingest)    |  |                |  |  |
+|  |  +-----------------+  +----------------+  +----------------+  |  |
+|  +--------------------------------------------------------------+  |
+|                                                                     |
+|  +--------------------------------------------------------------+  |
+|  |                  Service Layer                                |  |
+|  |                                                               |  |
+|  |  embeddingService  --> AST parse + embed symbols              |  |
+|  |  graphService      --> Store/query dependency graph           |  |
+|  |  ingestionService  --> Fetch repo files from GitHub           |  |
+|  |  retrievalService  --> Diff-aware impact retrieval            |  |
+|  |  updationService   --> Handle push updates                    |  |
+|  |  llmService        --> Generate reviews and answers           |  |
+|  +--------------------------------------------------------------+  |
+|                                                                     |
+|  +--------------------------------------------------------------+  |
+|  |                   HTTP API                                    |  |
+|  |   POST /query (API Key auth) --> Semantic codebase Q&A       |  |
+|  +--------------------------------------------------------------+  |
++=========+=================+=================+====================+
+          |                 |                 |
+          v                 v                 v
++----------------+ +----------------+ +------------------+
+| Neon PostgreSQL| | Pinecone       | | Google GenAI     |
+| (Serverless)   | | Vector DB      | | (Gemma 3 12B)   |
+|                | |                | |                  |
+| Tables:        | | Index:         | | Tasks:           |
+| - users        | | code-review-   | | - PR Review      |
+| - installations| |   index        | | - Code Q&A       |
+| - repositories | | Dim: 768      | |                  |
+| - symbols      | | Metric: cosine| | Embedding Model: |
+| - edges        | |                | | HuggingFace      |
+|                | | Metadata:      | | all-mpnet-base-v2|
+| Graph:         | | repo, path,   | |                  |
+| symbols-->edges| | symbolName,   | |                  |
+| (nodes) (deps) | | code text     | |                  |
++----------------+ +----------------+ +------------------+
+
+7.2 Module Descriptions
+------------------------
+
+Module 1: Webhook Service
+  - Receives GitHub webhook events over HTTPS.
+  - Verifies webhook signature using HMAC SHA-256 with a shared secret.
+  - Routes events to appropriate BullMQ queues based on event type.
+  - Stateless — does no processing, only enqueues.
+
+Module 2: Ingestion Worker
+  - Authenticates as the GitHub App using the installation ID.
+  - Fetches the full repository file tree via the GitHub Trees API.
+  - Filters for JavaScript/TypeScript files (.js, .jsx, .ts, .tsx, .mjs, .cjs).
+  - Downloads file contents as base64-decoded blobs.
+  - Invokes the embedding service for AST parsing and vectorization.
+
+Module 3: Embedding Service (AST Pipeline)
+  - Parses code into AST using @babel/parser with JSX and TypeScript plugins.
+  - Traverses AST to extract symbols (FunctionDeclaration, ClassDeclaration, 
+    ClassMethod, ArrowFunctionExpression, FunctionExpression).
+  - Extracts dependencies (CallExpression for function calls, 
+    ImportDeclaration/require for module imports).
+  - Uses a symbol stack data structure for correct nested scope handling.
+  - Generates 768-dim embeddings via HuggingFace Inference API.
+  - Uploads vectors to Pinecone in batches of 50.
+
+Module 4: Graph Service
+  - Provides CRUD operations on the symbol-edge graph in PostgreSQL.
+  - Two-phase insertion: symbols first, then edges (prevents orphaned edges).
+  - Cascading deletes via foreign key constraints.
+  - Conflict-safe inserts with ON CONFLICT DO NOTHING.
+
+Module 5: Retrieval Service (Impact Analysis Engine)
+  - Parses Git diffs using the parse-diff library.
+  - Maps diff chunks to old-file line coordinates.
+  - Queries symbols table with overlap formula to find affected symbols.
+  - Expands impact via edge traversal (follows outgoing "calls" edges).
+  - Fetches source code of impacted symbols from Pinecone metadata.
+
+Module 6: LLM Service
+  - Formats impact context into structured prompt sections.
+  - Manages two prompt templates: Q&A mode and PR Review mode.
+  - PR Review prompt instructs the LLM to compare the diff against 
+    impacted downstream code and categorize findings.
+  - Controls generation parameters (temperature, topP, topK).
+
+Module 7: Update Service
+  - Handles incremental updates on push to the default branch.
+  - Delete-then-insert strategy ensures data consistency.
+  - Processes both modified files (re-ingest) and removed files (clean up).
+
+
+================================================================================
+8. PROTOCOL STACK
+================================================================================
+
+The system's communication is organized into the following layered 
+protocol stack, described from the application layer down:
+
++--------------------------------------------------------------------+
+| LAYER 7: APPLICATION LAYER                                          |
+|   - GitHub Webhook Events (JSON payloads over HTTPS)                |
+|   - REST API Endpoints (POST /query, POST /api/webhook)            |
+|   - GitHub REST API v3 (Octokit SDK)                                |
+|   - Google GenAI API (LLM inference requests)                       |
+|   - HuggingFace Inference API (embedding generation)                |
+|   - Pinecone REST API (vector upsert, query, delete)               |
++--------------------------------------------------------------------+
+| LAYER 6: AUTHENTICATION & AUTHORIZATION LAYER                       |
+|   - GitHub App Authentication (JWT + Installation Tokens)           |
+|   - Webhook Signature Verification (HMAC SHA-256)                   |
+|   - API Key Authentication (X-API-Key header for /query endpoint)   |
+|   - Pinecone API Key Authentication                                 |
+|   - Google GenAI API Key Authentication                             |
++--------------------------------------------------------------------+
+| LAYER 5: MESSAGE QUEUE LAYER (Asynchronous Processing)              |
+|   - BullMQ Job Queues (ingestion-queue, update-queue, review-queue) |
+|   - Job Serialization: JSON                                         |
+|   - Retry Policy: Exponential backoff (5s base, 3 attempts)        |
+|   - Concurrency Control: Review worker x2, others x1               |
+|   - Job Deduplication: Unique job IDs per PR/event                  |
++--------------------------------------------------------------------+
+| LAYER 4: DATA ACCESS LAYER                                          |
+|   - Drizzle ORM (type-safe SQL query builder for PostgreSQL)        |
+|   - Connection Pooling via pg.Pool with SSL (Neon serverless)       |
+|   - Pinecone SDK (vector operations with metadata filtering)        |
+|   - Redis Protocol (ioredis client, TLS-encrypted)                  |
++--------------------------------------------------------------------+
+| LAYER 3: DATA STORAGE LAYER                                         |
+|   - PostgreSQL (Neon Serverless): Relational graph storage          |
+|     Tables: users, installations, repositories, symbols, edges      |
+|     Indexing: B-tree indexes on repositoryId, fromSymbolId,         |
+|               toSymbolId; Unique constraints for deduplication      |
+|   - Pinecone: Vector storage                                        |
+|     Dimension: 768, Metric: Cosine similarity                       |
+|     Metadata: repo, path, symbolName, symbolType, lineRange, text   |
+|   - Redis (Upstash): Job queue persistence + state                  |
++--------------------------------------------------------------------+
+| LAYER 2: TRANSPORT LAYER                                            |
+|   - HTTPS/TLS 1.2+ for all external API communications             |
+|   - TLS-encrypted Redis connections (Upstash requirement)           |
+|   - SSL-required PostgreSQL connections (Neon requirement)          |
+|   - TCP connections managed by Node.js HTTP agent and pg.Pool       |
++--------------------------------------------------------------------+
+| LAYER 1: NETWORK / INFRASTRUCTURE LAYER                             |
+|   - Node.js runtime (Express HTTP servers)                          |
+|   - Microservice deployment (webhook-services + rag-services)       |
+|   - Cloud-hosted databases (Neon, Pinecone, Upstash)                |
+|   - GitHub Cloud (webhook delivery infrastructure)                  |
++--------------------------------------------------------------------+
+
+
+================================================================================
+9. TESTBED / EXPERIMENTAL SETUP
+================================================================================
+
+9.1 Development Environment
+----------------------------
+  - Runtime: Node.js (v18+)
+  - Language: JavaScript (ES Modules + CommonJS interop)
+  - Package Manager: npm
+  - IDE: Visual Studio Code
+
+9.2 Cloud Services and Infrastructure
+---------------------------------------
+  - Database: Neon PostgreSQL (serverless, auto-scaling)
+    Purpose: Stores code dependency graph (symbols + edges), user data, 
+    installation metadata, and repository records.
+    ORM: Drizzle ORM with drizzle-kit for schema migrations.
+
+  - Vector Database: Pinecone (managed, serverless)
+    Index: "code-review-index"
+    Dimensions: 768 (matching all-mpnet-base-v2 output)
+    Similarity Metric: Cosine
+    Purpose: Stores semantic embeddings of code symbols for retrieval.
+
+  - Message Broker: Redis via Upstash (serverless, TLS-encrypted)
+    Purpose: Backs BullMQ job queues for asynchronous event processing.
+    Queues: ingestion-queue, update-queue, review-queue.
+
+  - LLM Provider: Google GenAI
+    Model: gemma-3-12b-it (Gemma 3, 12 billion parameters, 
+    instruction-tuned, open-weights)
+    Purpose: Generates pull request reviews and codebase Q&A answers.
+
+  - Embedding Model: HuggingFace Inference API
+    Model: sentence-transformers/all-mpnet-base-v2
+    Dimension: 768
+    Purpose: Generates semantic embeddings for code symbols.
+
+  - Version Control Platform: GitHub
+    Integration: GitHub App (OAuth-based, scoped permissions per install)
+    Events: pull_request, push, installation, installation_repositories
+    Authentication: JWT-based app authentication + installation tokens.
+
+9.3 Software Libraries and Frameworks
+---------------------------------------
+  Category              | Library                          | Version  | Purpose
+  ----------------------|----------------------------------|----------|---------------------------
+  HTTP Server           | Express                          | 5.2.1    | REST API framework
+  GitHub Integration    | @octokit/app                     | 13.1.8   | GitHub App SDK
+  GitHub API Client     | octokit                          | 5.0.5    | REST API calls
+  AST Parser            | @babel/parser                    | 7.29.0   | JS/TS AST generation
+  AST Traversal         | @babel/traverse                  | 7.29.0   | AST walking/symbol extraction
+  LLM Client            | @google/genai                    | 1.40.0   | Google GenAI SDK
+  LangChain Core        | @langchain/core                  | 1.1.19   | RAG framework
+  LangChain Embeddings  | @langchain/community             | 1.1.11   | HuggingFace embeddings
+  Text Splitting        | @langchain/textsplitters         | 1.0.1    | Text chunking utilities
+  HuggingFace Client    | @huggingface/inference           | 4.13.11  | Embedding API client
+  Vector DB Client      | @pinecone-database/pinecone      | 6.1.0    | Pinecone SDK
+  ORM                   | drizzle-orm                      | 0.45.1   | Type-safe SQL ORM
+  Schema Migrations     | drizzle-kit                      | 0.31.9   | DB migration tooling
+  PostgreSQL Driver     | pg                               | 8.18.0   | Native PG client
+  Job Queue             | bullmq                           | 5.69.3   | Redis-backed job queue
+  Redis Client          | ioredis                          | 5.9.3    | Redis protocol client
+  Diff Parser           | parse-diff                       | 0.11.1   | Git diff parsing
+  Env Configuration     | dotenv                           | 16.6.1   | Environment variables
+
+9.4 Database Schema Specification
+----------------------------------
+  Table: users (5 columns + timestamps)
+    - Synced from Clerk authentication system
+    - Fields: clerkId (unique), email, fullName, avatarUrl, githubId, 
+      tier (free/paid), credits (integer)
+
+  Table: installations (5 columns + timestamp)
+    - Links GitHub App installations to users
+    - Fields: userId (FK → users), githubInstallationId (unique), 
+      accountLogin, accountType
+
+  Table: repositories (8 columns + timestamp)
+    - Tracks indexed repositories
+    - Fields: installationId (FK → installations), githubRepoId, name, 
+      fullName, url, private, isIndexed
+    - Constraint: Unique(installationId, githubRepoId)
+
+  Table: symbols (8 columns + timestamp) — Graph Nodes
+    - Stores AST-extracted code symbols
+    - Fields: repositoryId (FK → repositories), filePath, symbolName, 
+      symbolType, startLine, endLine
+    - Constraint: Unique(repositoryId, filePath, symbolName, startLine)
+    - Indexes: idx_symbols_repo
+
+  Table: edges (5 columns + timestamp) — Graph Edges
+    - Stores call/import dependencies between symbols
+    - Fields: repositoryId (FK → repositories), fromSymbolId (FK → symbols), 
+      toSymbolId (FK → symbols), edgeType (calls | imports)
+    - Constraint: Unique(repositoryId, fromSymbolId, toSymbolId, edgeType)
+    - Indexes: idx_edges_repo, idx_edges_from_symbol, idx_edges_to_symbol
+
+9.5 Testing Infrastructure
+----------------------------
+  - Mock Payloads: mockPayload.js simulates full repository structure 
+    (utils.js, service.js, controller.js) for ingestion testing.
+  - Mock Update Payloads: mockUpdatePayload.js simulates push events 
+    with modified and deleted files.
+  - Test Server: testServer.js provides standalone endpoints for 
+    isolated testing of ingestion, query, and impact analysis pipelines.
+  - SDK Smoke Tests: sdkTest.js verifies Pinecone vector database 
+    connectivity and operations.
+
+9.6 Queue Configuration Details
+---------------------------------
+  Queue: review-queue
+    Concurrency: 2 (parallel PR processing)
+    Retry Attempts: 3
+    Backoff Strategy: Exponential (base delay: 5000ms)
+    Job Removal: Completed jobs auto-removed from Redis
+
+  Queue: ingestion-queue
+    Concurrency: 1 (sequential repo processing)
+    Job Removal: Completed jobs auto-removed
+
+  Queue: update-queue  
+    Concurrency: 1 (sequential update processing)
+    Job Removal: Completed jobs auto-removed
+
+9.7 Security Measures
+----------------------
+  - Webhook Signature Verification: HMAC SHA-256 with shared secret
+  - API Key Authentication: X-API-Key header required for query endpoint
+  - TLS Encryption: All database and cache connections use TLS
+  - GitHub App Scoping: Permissions scoped per installation
+  - Environment Variable Isolation: All secrets stored in .env files
+  - Cascading Deletes: Foreign key constraints prevent orphaned data
+
+
+================================================================================
+                          END OF SUBMISSION DOCUMENT
+================================================================================
+
+Prepared for academic evaluation.
+All content is original and based on the actual implemented system.
+================================================================================

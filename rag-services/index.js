@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require('express');
 const { App } = require('@octokit/app');
 const fs = require('fs');
+const { Worker } = require('bullmq');
 
 // --- Services ---
 const { ingestRepo } = require('./services/ingestionServices.js');
@@ -12,12 +13,13 @@ const { generateAnswer, generatePRReview } = require('./services/llmService.js')
 const { getPineconeIndex } = require('./config/pinecone');
 const { db } = require("./config/db.js");
 
-// ✅ NEW IMPORTS: Needed for robust DB lookups
+// --- DB & Redis ---
 const { repositories } = require("./lib/db/schema");
 const { eq, and } = require("drizzle-orm");
+const { redisConnection } = require('./config/redis'); // Make sure this file exists!
 
 const app = express();
-const PORT = 4000; 
+const PORT = process.env.PORT || 3000; 
 
 // Handle Private Key
 const privateKey = process.env.PRIVATE_KEY
@@ -33,7 +35,7 @@ const githubApp = new App({
 app.use(express.json());
 
 // ==================================================================
-// 🔒 SECURITY MIDDLEWARE
+// 🔒 SECURITY MIDDLEWARE (Only applies to HTTP routes like /query)
 // ==================================================================
 app.use((req, res, next) => {
     const apiKey = req.headers['x-api-key'];
@@ -41,7 +43,7 @@ app.use((req, res, next) => {
 
     if (!apiKey || apiKey !== validKey) {
         console.warn(`🛑 Blocked unauthorized access attempt from ${req.ip}`);
-        return res.status(401).json({ error: 'Unauthorized: Invalid or missing API Key' });
+        return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
     }
     next();
 });
@@ -56,193 +58,146 @@ async function checkDatabase() {
     }
 }
 
-// 1. INGESTION ROUTE
-app.post('/ingest', async (req, res) => {
-    const { installationId, owner, repo, githubRepoId } = req.body;
+// ==================================================================
+// 1️⃣ INGESTION WORKER
+// ==================================================================
+const ingestionWorker = new Worker('ingestion-queue', async (job) => {
+    const { installationId, owner, repo, githubRepoId } = job.data;
+    console.log(`\n📥 [WORKER: INGEST] Starting for ${owner}/${repo} (GitHub ID: ${githubRepoId})`);
+
+    const octokit = await githubApp.getInstallationOctokit(installationId);
+    const result = await ingestRepo(octokit, owner, repo, installationId);
     
-    console.log(`\n📥 [INGEST] Received request for ${owner}/${repo} (GitHub ID: ${githubRepoId})`);
-    res.status(202).send({ status: 'Ingestion started' }); 
-
-    try {
-        const octokit = await githubApp.getInstallationOctokit(installationId);
-        
-        console.log(`   📡 Syncing Neon DB and fetching files from GitHub...`);
-        
-        // Note: ingestRepo internally handles syncing the DB. 
-        // We pass the basics, and it will fetch/ensure the repo exists.
-        const result = await ingestRepo(octokit, owner, repo, installationId);
-        
-        if (!result || !result.files || result.files.length === 0) {
-            console.log(`   ⚠️ No code files found in ${owner}/${repo}.`);
-            return;
-        }
-
-        console.log(`   ⚙️ Processing ${result.files.length} files for AST & Pinecone...`);
-        
-        await processAndStore(result.files, result.repositoryId, owner, repo);
-        
-        console.log(`✅ [INGEST] Complete for ${owner}/${repo}`);
-    } catch (error) {
-        console.error(`❌ [INGEST] Failed for ${owner}/${repo}:`, error.message);
+    if (!result || !result.files || result.files.length === 0) {
+        console.log(`   ⚠️ No code files found in ${owner}/${repo}.`);
+        return;
     }
-});
 
-// 2. UPDATE ROUTE
-app.post('/update', async (req, res) => {
-    const { installationId, owner, repo, githubRepoId, modifiedFilePaths, removedFilePaths } = req.body;
+    console.log(`   ⚙️ Processing ${result.files.length} files for AST & Pinecone...`);
+    await processAndStore(result.files, result.repositoryId, owner, repo);
     
-    console.log(`\n🔄 [UPDATE] Received changes for ${owner}/${repo}`);
-    res.status(202).send({ status: 'Update started' });
+}, { connection: redisConnection });
 
-    try {
-        const octokit = await githubApp.getInstallationOctokit(installationId);
-        const modifiedFilesWithContent = [];
+ingestionWorker.on('completed', job => console.log(`✅ [INGEST] Complete for ${job.data.repo}`));
+ingestionWorker.on('failed', (job, err) => console.error(`❌ [INGEST] Failed for ${job?.data?.repo}:`, err.message));
 
-        // 1. Fetch content (Webhook server doesn't send content to keep payload light)
-        if (modifiedFilePaths && modifiedFilePaths.length > 0) {
-            console.log(`   📡 Fetching content for ${modifiedFilePaths.length} files...`);
-            
-            for (const path of modifiedFilePaths) {
-                try {
-                    const { data } = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
-                        owner, repo, path
-                    });
-                    
-                    const content = Buffer.from(data.content, 'base64').toString('utf-8');
-                    modifiedFilesWithContent.push({ path, content });
-                } catch (err) {
-                    console.error(`   ⚠️ Failed to fetch content for ${path}:`, err.message);
-                }
+// ==================================================================
+// 2️⃣ UPDATE WORKER
+// ==================================================================
+const updateWorker = new Worker('update-queue', async (job) => {
+    const { installationId, owner, repo, githubRepoId, modifiedFilePaths, removedFilePaths } = job.data;
+    console.log(`\n🔄 [WORKER: UPDATE] Processing changes for ${owner}/${repo}`);
+
+    const octokit = await githubApp.getInstallationOctokit(installationId);
+    const modifiedFilesWithContent = [];
+
+    if (modifiedFilePaths && modifiedFilePaths.length > 0) {
+        console.log(`   📡 Fetching content for ${modifiedFilePaths.length} files...`);
+        for (const path of modifiedFilePaths) {
+            try {
+                const { data } = await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', { owner, repo, path });
+                const content = Buffer.from(data.content, 'base64').toString('utf-8');
+                modifiedFilesWithContent.push({ path, content });
+            } catch (err) {
+                console.error(`   ⚠️ Failed to fetch content for ${path}:`, err.message);
             }
         }
-
-        // 2. Process Updates
-        if (modifiedFilesWithContent.length > 0 || (removedFilePaths && removedFilePaths.length > 0)) {
-            // Note: updateRepoFiles looks up the Repo ID internally by name, 
-            // which works fine since we just verified the repo exists via Octokit.
-            await updateRepoFiles(owner, repo, modifiedFilesWithContent, removedFilePaths);
-        }
-        
-    } catch (error) {
-        console.error(`❌ [UPDATE] Failed for ${owner}/${repo}:`, error.message);
     }
-});
 
-// 3. QUERY ROUTE (Chat)
+    if (modifiedFilesWithContent.length > 0 || (removedFilePaths && removedFilePaths.length > 0)) {
+        await updateRepoFiles(owner, repo, modifiedFilesWithContent, removedFilePaths);
+    }
+}, { connection: redisConnection });
+
+updateWorker.on('completed', job => console.log(`✅ [UPDATE] Complete for ${job.data.repo}`));
+updateWorker.on('failed', (job, err) => console.error(`❌ [UPDATE] Failed for ${job?.data?.repo}:`, err.message));
+
+// ==================================================================
+// 3️⃣ PR REVIEW WORKER
+// ==================================================================
+const reviewWorker = new Worker('review-queue', async (job) => {
+    let { diff, title, description, owner, repo, installationId, pull_number, githubRepoId } = job.data;
+    let repositoryId; // Local Neon ID
+
+    console.log(`\n🧐 [WORKER: REVIEW] Analyzing PR: "${title}" (#${pull_number})`);
+
+    if (!diff) throw new Error("No diff provided in job payload");
+
+    // Resolve 'repositoryId' (Neon DB ID)
+    let repoRecord;
+    if (githubRepoId) {
+        repoRecord = await db.query.repositories.findFirst({
+            where: eq(repositories.githubRepoId, githubRepoId)
+        });
+    }
+
+    if (!repoRecord) {
+        console.log("   ⚠️ GitHub ID lookup failed. Falling back to name lookup...");
+        repoRecord = await db.query.repositories.findFirst({
+            where: and(eq(repositories.name, repo), eq(repositories.fullName, `${owner}/${repo}`))
+        });
+    }
+
+    if (repoRecord) {
+        repositoryId = repoRecord.id;
+    } else {
+        console.warn("   ⚠️ Repo not found in DB. Graph Context will be unavailable.");
+    }
+
+    const impactedContext = await retrieveImpactContext(diff, repositoryId, owner, repo);
+    const review = await generatePRReview(diff, title, description, impactedContext);
+    
+    // Post to GitHub
+    if (installationId && pull_number) {
+        console.log(`   📡 Posting review comment to GitHub PR #${pull_number}...`);
+        const octokit = await githubApp.getInstallationOctokit(installationId);
+        
+        await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+            owner,
+            repo,
+            issue_number: pull_number,
+            body: review
+        });
+    } else {
+        throw new Error("Missing installationId or pull_number. Cannot post to GitHub.");
+    }
+
+}, { connection: redisConnection, concurrency: 2 }); // Process up to 2 PRs at the exact same time
+
+reviewWorker.on('completed', job => console.log(`✅ [REVIEW] Complete for PR #${job.data.pull_number}`));
+reviewWorker.on('failed', (job, err) => console.error(`❌ [REVIEW] Failed for PR #${job?.data?.pull_number}:`, err.message));
+
+// ==================================================================
+// HTTP ROUTES (Synchronous Tasks)
+// ==================================================================
 app.post('/query', async (req, res) => {
     const { query, repo } = req.body;
-    console.log(`\n🔍 [QUERY] User asked: "${query}" in ${repo}`);
+    console.log(`\n🔍 [HTTP: QUERY] User asked: "${query}" in ${repo}`);
 
     try {
         const codeMatches = await searchCodebase(query, repo);
         const answer = await generateAnswer(query, codeMatches);
-
-        res.json({
-            query,
-            matches: codeMatches,
-            answer
-        });
-
+        res.json({ query, matches: codeMatches, answer });
     } catch (error) {
         console.error("❌ [QUERY] Error:", error.message);
         res.status(500).json({ error: "Search failed" });
     }
 });
 
-// 4. PR REVIEW ROUTE (OPTIMIZED)
-app.post('/review', async (req, res) => {
-    // 1. Destructure all new metadata
-    let { 
-        diff, 
-        title, 
-        description, 
-        owner, 
-        repo, 
-        repositoryId, // Neon ID (usually undefined from webhook)
-        installationId, 
-        pull_number, 
-        githubRepoId // GitHub ID (Passed from Webhook)
-    } = req.body;
-
-    console.log(`\n🧐 [REVIEW] Analyzing PR: "${title}" (#${pull_number})`);
-
-    try {
-        if (!diff) return res.status(400).json({ error: "No diff provided" });
-
-        // 🚨 CRITICAL: Resolve 'repositoryId' (Neon DB ID) required for Graph Retrieval
-        if (!repositoryId) {
-            let repoRecord;
-
-            // Strategy A: Lookup by GitHub ID (Fastest & Safest)
-            if (githubRepoId) {
-                repoRecord = await db.query.repositories.findFirst({
-                    where: eq(repositories.githubRepoId, githubRepoId)
-                });
-            }
-
-            // Strategy B: Lookup by Name (Fallback)
-            if (!repoRecord) {
-                console.log("   ⚠️ GitHub ID lookup failed. Falling back to name lookup...");
-                repoRecord = await db.query.repositories.findFirst({
-                    where: and(
-                        eq(repositories.name, repo),
-                        eq(repositories.fullName, `${owner}/${repo}`)
-                    )
-                });
-            }
-
-            if (repoRecord) {
-                repositoryId = repoRecord.id;
-            } else {
-                console.warn("   ⚠️ Repo not found in DB. Graph Context will be unavailable.");
-            }
-        }
-
-        // 2. Retrieve Context (Now guaranteed to use the correct ID if found)
-        const impactedContext = await retrieveImpactContext(diff, repositoryId, owner, repo);
-
-        // 3. Generate Review
-        const review = await generatePRReview(diff, title, description, impactedContext);
-        
-        // 4. Post to GitHub
-        if (installationId && pull_number) {
-            try {
-                console.log(`   📡 Posting review comment to GitHub PR #${pull_number}...`);
-                const octokit = await githubApp.getInstallationOctokit(installationId);
-                
-                await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
-                    owner,
-                    repo,
-                    issue_number: pull_number,
-                    body: review
-                });
-
-                console.log(`   ✅ Comment posted successfully.`);
-            } catch (postError) {
-                console.error(`   ⚠️ Failed to post comment to GitHub: ${postError.message}`);
-            }
-        } else {
-            console.log("   ℹ️ Skipping GitHub comment (Missing installationId or pull_number)");
-        }
-
-        console.log("✅ [REVIEW] Analysis Complete.");
-        res.json({ review });
-
-    } catch (error) {
-        console.error("❌ [REVIEW] Failed:", error.message);
-        res.status(500).json({ error: "Review generation failed" });
-    }
-});
-
 // Server Start
-app.listen(PORT, async () => {
-    console.log(`🧠 RAG Brain listening on port ${PORT}`);
+app.listen(PORT, "0.0.0.0", async () => {
+    console.log(`🧠 RAG Brain HTTP Server running on port ${PORT}`);
+    console.log(`👷 BullMQ Workers actively listening to Redis...`);
+    
     await checkDatabase();
+    
     try {
         const index = await getPineconeIndex();
         if (index) {
             const stats = await index.describeIndexStats();
             console.log(`✅ Pinecone Connected! (Vectors: ${stats.totalRecordCount})`);
         }
-    } catch (error) { console.error("❌ Pinecone Connection Failed:", error.message); }
+    } catch (error) { 
+        console.error("❌ Pinecone Connection Failed:", error.message); 
+    }
 });

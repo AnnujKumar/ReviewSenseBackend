@@ -1,0 +1,97 @@
+@startuml GraphRAG_DataFlow
+
+!theme cerulean
+skinparam backgroundColor #FEFEFE
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam shadowing true
+skinparam roundCorner 10
+skinparam ActivityDiamondFontSize 10
+
+skinparam rectangle {
+    BorderColor #4A6FA5
+    BackgroundColor #FFFFFF
+}
+
+skinparam arrow {
+    Color #4A6FA5
+    FontColor #555555
+    FontSize 10
+}
+
+title <size:18><b>GraphRAG Code Reviewer — PR Review Data Flow</b></size>\n<size:12><color:#666666>From GitHub Webhook to AI-Generated Review Comment</color></size>
+
+|#E8F0FE| **GitHub** |
+start
+:Developer opens / updates\na **Pull Request**;
+:GitHub sends **Webhook Event**\n(HMAC SHA-256 signed);
+
+|#F5F0FF| **Webhook Service** |
+:Verify webhook\nsignature (crypto);
+:Fetch PR diff via\nGitHub REST API;
+:Enqueue to **review-queue**\n(BullMQ → Redis);
+
+|#FFF8E7| **Message Queue** |
+:Job picked up by\n**Review Worker**\n(concurrency: 2);
+
+|#F0FFF0| **RAG Service** |
+
+partition "**Phase 1: Diff Analysis**" #E5F5E5 {
+    :Parse diff using\n**parse-diff** library;
+    :Extract changed **file paths**\nand **line ranges**\n(old-file coordinates);
+}
+
+partition "**Phase 2: Impact Detection**" #E5F5E5 {
+    :Query **Neon PostgreSQL**\nsymbols table;
+    note right
+        **Overlap Formula:**
+        SymbolStart ≤ RangeEnd
+        AND
+        SymbolEnd ≥ RangeStart
+    end note
+    :Find **directly affected symbols**\n(functions, classes, methods);
+    :Traverse **dependency graph**\nvia edges table;
+    note right
+        Follow outgoing
+        "calls" edges to find
+        downstream dependents
+    end note
+    :Build **expanded impact set**\n(base + downstream symbols);
+}
+
+partition "**Phase 3: Context Retrieval**" #E5F5E5 {
+    :Query **Pinecone** vector DB\nfor impacted symbol code;
+    :Retrieve **source code snippets**\nwith metadata\n(path, type, line range);
+}
+
+partition "**Phase 4: LLM Review Generation**" #FFF0F0 {
+    :Construct **structured prompt**\nSection 1: Diff\nSection 2: Impact Radius;
+    :Send to **Google GenAI**\n(gemma-3-12b-it)\nTemperature: 0.1;
+    note right
+        Detect:
+        🔴 Critical Issues
+        🟡 Suggestions
+        🟢 Commendations
+    end note
+    :Receive **Markdown review**;
+}
+
+|#F5F0FF| **Webhook Service** |
+:Post review as **PR comment**\nvia GitHub API;
+
+|#E8F0FE| **GitHub** |
+:Review appears on\nthe **Pull Request**;
+
+stop
+
+legend bottom right
+    |= Phase |= Database / Service |
+    | Diff Analysis | parse-diff library |
+    | Impact Detection | Neon PostgreSQL (graph) |
+    | Context Retrieval | Pinecone (vectors) |
+    | Review Generation | Google GenAI (LLM) |
+endlegend
+
+footer <size:10><i>GraphRAG Code Reviewer — Pull Request Review Data Flow</i></size>
+
+@enduml

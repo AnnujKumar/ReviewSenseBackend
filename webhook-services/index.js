@@ -4,14 +4,13 @@ const crypto = require("crypto");
 const { getPullRequestDiff } = require("./services/gitHubServices.js");
 const { App } = require('@octokit/app');
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-const RAG_SERVICE_URL = process.env.RAG_SERVICE;
+// 🚀 IMPORT QUEUES
+const { ingestionQueue, updateQueue, reviewQueue } = require('./config/queue');
 
-if (!RAG_SERVICE_URL) {
-  console.error("❌ RAG_SERVICE environment variable not set!");
-  process.exit(1);
-}
+const app = express();
+const PORT = process.env.PORT || 5000
+
+// Remove RAG_SERVICE_URL check - we don't use HTTP anymore!
 
 const privateKey = process.env.PRIVATE_KEY
   ? process.env.PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -48,35 +47,7 @@ const verifyGitHubSignature = (req, res, next) => {
 };
 
 // --------------------------------------------------
-// Helper: Call RAG Safely (with logging)
-// --------------------------------------------------
-async function callRag(endpoint, body) {
-  try {
-    console.log(`   🌐 Calling RAG: ${endpoint}`);
-
-    const response = await fetch(`${RAG_SERVICE_URL}${endpoint}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.INTERNAL_API_KEY
-      },
-      body: JSON.stringify(body)
-    });
-
-    const text = await response.text();
-
-    console.log(`   📡 RAG Response: ${response.status}`);
-    if (!response.ok) {
-      console.error(`   ❌ RAG Error Body: ${text}`);
-    }
-
-  } catch (err) {
-    console.error("   ❌ RAG Network Failure:", err.message);
-  }
-}
-
-// --------------------------------------------------
-// Main Webhook Handler
+// Main Webhook Handler (BullMQ Producer)
 // --------------------------------------------------
 app.post('/api/webhook', verifyGitHubSignature, async (req, res) => {
   const event = req.headers['x-github-event'];
@@ -87,7 +58,7 @@ app.post('/api/webhook', verifyGitHubSignature, async (req, res) => {
     console.log(`🔔 Received Event: ${event}`);
 
     // ========================================================
-    // 1️⃣ Pull Request
+    // 1️⃣ Pull Request -> Queue for Review
     // ========================================================
     if (event === 'pull_request') {
       const { action, pull_request, repository } = payload;
@@ -98,13 +69,14 @@ app.post('/api/webhook', verifyGitHubSignature, async (req, res) => {
         const prNumber = pull_request.number;
         const githubRepoId = repository.id;
 
-        console.log(`📜 PR #${prNumber} (${action}) in ${owner}/${repo}`);
+        console.log(`📜 Queuing PR #${prNumber} (${action}) in ${owner}/${repo}`);
 
         const octokit = await githubApp.getInstallationOctokit(installationId);
         const diff = await getPullRequestDiff(octokit, owner, repo, prNumber);
 
         if (diff) {
-          await callRag("/review", {
+          // Add to Redis Review Queue
+          await reviewQueue.add('review-pr', {
             diff,
             title: pull_request.title,
             description: pull_request.body,
@@ -113,15 +85,18 @@ app.post('/api/webhook', verifyGitHubSignature, async (req, res) => {
             installationId,
             pull_number: prNumber,
             githubRepoId
+          }, {
+            // jobId prevents exact duplicates if GitHub retries the webhook
+            jobId: `pr-${githubRepoId}-${prNumber}-${Date.now()}` 
           });
         }
       }
 
-      return res.status(200).send('PR processed');
+      return res.status(202).send('PR queued');
     }
 
     // ========================================================
-    // 2️⃣ Push
+    // 2️⃣ Push -> Queue for Update
     // ========================================================
     if (event === 'push') {
       const { ref, repository, commits } = payload;
@@ -142,20 +117,28 @@ app.post('/api/webhook', verifyGitHubSignature, async (req, res) => {
         commit.removed.forEach(f => removedSet.add(f));
       });
 
-      await callRag("/update", {
-        installationId,
-        owner: repository.owner.login,
-        repo: repository.name,
-        githubRepoId,
-        modifiedFilePaths: Array.from(addedModifiedSet),
-        removedFilePaths: Array.from(removedSet)
-      });
+      const modifiedFilePaths = Array.from(addedModifiedSet);
+      const removedFilePaths = Array.from(removedSet);
 
-      return res.status(200).send('Push processed');
+      if (modifiedFilePaths.length > 0 || removedFilePaths.length > 0) {
+        console.log(`🔄 Queuing updates for ${repository.full_name}...`);
+        
+        // Add to Redis Update Queue
+        await updateQueue.add('update-kb', {
+          installationId,
+          owner: repository.owner.login,
+          repo: repository.name,
+          githubRepoId,
+          modifiedFilePaths,
+          removedFilePaths
+        });
+      }
+
+      return res.status(202).send('Push queued');
     }
 
     // ========================================================
-    // 3️⃣ Installation
+    // 3️⃣ Installation -> Queue for Ingestion
     // ========================================================
     if (event === 'installation' || event === 'installation_repositories') {
       const action = payload.action;
@@ -170,9 +153,10 @@ app.post('/api/webhook', verifyGitHubSignature, async (req, res) => {
       if (repos?.length > 0) {
         for (const repo of repos) {
           const [owner, repoName] = repo.full_name.split('/');
-          console.log(`✨ Triggering Ingestion: ${repo.full_name}`);
+          console.log(`✨ Queuing Ingestion: ${repo.full_name}`);
 
-          await callRag("/ingest", {
+          // Add to Redis Ingestion Queue
+          await ingestionQueue.add('ingest-repo', {
             installationId,
             owner,
             repo: repoName,
@@ -181,7 +165,7 @@ app.post('/api/webhook', verifyGitHubSignature, async (req, res) => {
         }
       }
 
-      return res.status(200).send('Installation processed');
+      return res.status(202).send('Installation queued');
     }
 
     return res.status(200).send('Ignored Event');
