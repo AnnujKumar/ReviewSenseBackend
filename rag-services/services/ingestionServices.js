@@ -1,6 +1,6 @@
-import { db } from '../config/db.js';
-import { repositories, installations, users } from '../lib/db/schema.js';
-import { eq } from 'drizzle-orm';
+const { db } = require('../config/db');
+const { repositories, installations, users } = require('../lib/db/schema.js');
+const { eq } = require('drizzle-orm');
 
 /**
  * Helper: Validates if a file is a JavaScript/TypeScript code file.
@@ -94,7 +94,7 @@ async function syncMetadataToDatabase(owner, repo, githubInstallationId, octokit
 }
 
 // YOUR ORIGINAL WORKING CODE
-export async function ingestRepo(octokit, owner, repo, githubInstallationId, defaultBranch = 'master') {
+async function ingestRepo(octokit, owner, repo, githubInstallationId, defaultBranch = 'master') {
     try {
         // Sync Neon & get repository record
         const repositoryRecord = await syncMetadataToDatabase(
@@ -168,3 +168,5 @@ export async function ingestRepo(octokit, owner, repo, githubInstallationId, def
         return null;
     }
 }
+
+module.exports = { ingestRepo };

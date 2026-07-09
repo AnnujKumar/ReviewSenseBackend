@@ -76,7 +76,7 @@ export const repositories = pgTable(
 );
 
 /* ============================================================
-   4️⃣ SYMBOLS (Graph Nodes)
+   4️⃣ SYMBOLS (Graph Nodes — Base Graph)
 ============================================================ */
 
 export const symbols = pgTable(
@@ -93,16 +93,16 @@ export const symbols = pgTable(
     symbolType: text('symbol_type').notNull(), // function | class | method
     startLine: integer('start_line').notNull(),
     endLine: integer('end_line').notNull(),
+    sourceCode: text('source_code'), // Monolithic code storage — avoids Pinecone round-trips
 
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => ({
-    // Prevent duplicate symbol insertion
+    // Deterministic unique constraint — no startLine dependency
     uniqueSymbol: uniqueIndex('unique_symbol').on(
       table.repositoryId,
       table.filePath,
-      table.symbolName,
-      table.startLine
+      table.symbolName
     ),
 
     // Performance index for repo-based queries
@@ -111,7 +111,7 @@ export const symbols = pgTable(
 );
 
 /* ============================================================
-   5️⃣ EDGES (Graph Dependencies)
+   5️⃣ EDGES (Graph Dependencies — Base Graph)
 ============================================================ */
 
 export const edges = pgTable(
@@ -152,6 +152,88 @@ export const edges = pgTable(
 );
 
 /* ============================================================
+   6️⃣ PR_SYMBOLS (Delta Graph — Isolated PR State)
+============================================================ */
+
+export const prSymbols = pgTable(
+  'pr_symbols',
+  {
+    id: serial('id').primaryKey(),
+
+    pullRequestId: integer('pull_request_id').notNull(),
+
+    repositoryId: integer('repository_id')
+      .references(() => repositories.id, { onDelete: 'cascade' })
+      .notNull(),
+
+    filePath: text('file_path').notNull(),
+    symbolName: text('symbol_name').notNull(),
+    symbolType: text('symbol_type').notNull(),
+    startLine: integer('start_line').notNull(),
+    endLine: integer('end_line').notNull(),
+    sourceCode: text('source_code'),
+
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    // Unique per PR — prevents duplicates within the same PR
+    uniquePrSymbol: uniqueIndex('unique_pr_symbol').on(
+      table.pullRequestId,
+      table.filePath,
+      table.symbolName
+    ),
+
+    // Performance indexes
+    prIndex: index('idx_pr_symbols_pr').on(table.pullRequestId),
+    repoIndex: index('idx_pr_symbols_repo').on(table.repositoryId),
+  })
+);
+
+/* ============================================================
+   7️⃣ PR_EDGES (Delta Graph — Isolated PR Dependencies)
+============================================================ */
+
+export const prEdges = pgTable(
+  'pr_edges',
+  {
+    id: serial('id').primaryKey(),
+
+    pullRequestId: integer('pull_request_id').notNull(),
+
+    repositoryId: integer('repository_id')
+      .references(() => repositories.id, { onDelete: 'cascade' })
+      .notNull(),
+
+    fromSymbolId: integer('from_symbol_id')
+      .references(() => prSymbols.id, { onDelete: 'cascade' })
+      .notNull(),
+
+    toSymbolId: integer('to_symbol_id')
+      .references(() => prSymbols.id, { onDelete: 'cascade' })
+      .notNull(),
+
+    edgeType: text('edge_type').notNull(),
+
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    // Prevent duplicate PR edges
+    uniquePrEdge: uniqueIndex('unique_pr_edge').on(
+      table.pullRequestId,
+      table.fromSymbolId,
+      table.toSymbolId,
+      table.edgeType
+    ),
+
+    // Performance indexes
+    prIndex: index('idx_pr_edges_pr').on(table.pullRequestId),
+    repoIndex: index('idx_pr_edges_repo').on(table.repositoryId),
+    toIndex: index('idx_pr_edges_to_symbol').on(table.toSymbolId),
+    fromIndex: index('idx_pr_edges_from_symbol').on(table.fromSymbolId),
+  })
+);
+
+/* ============================================================
    RELATIONSHIPS
 ============================================================ */
 
@@ -179,6 +261,8 @@ export const repositoriesRelations = relations(
     }),
     symbols: many(symbols),
     edges: many(edges),
+    prSymbols: many(prSymbols),
+    prEdges: many(prEdges),
   })
 );
 
@@ -202,5 +286,28 @@ export const edgesRelations = relations(edges, ({ one }) => ({
   toSymbol: one(symbols, {
     fields: [edges.toSymbolId],
     references: [symbols.id],
+  }),
+}));
+
+export const prSymbolsRelations = relations(prSymbols, ({ one, many }) => ({
+  repository: one(repositories, {
+    fields: [prSymbols.repositoryId],
+    references: [repositories.id],
+  }),
+  outgoingEdges: many(prEdges),
+}));
+
+export const prEdgesRelations = relations(prEdges, ({ one }) => ({
+  repository: one(repositories, {
+    fields: [prEdges.repositoryId],
+    references: [repositories.id],
+  }),
+  fromSymbol: one(prSymbols, {
+    fields: [prEdges.fromSymbolId],
+    references: [prSymbols.id],
+  }),
+  toSymbol: one(prSymbols, {
+    fields: [prEdges.toSymbolId],
+    references: [prSymbols.id],
   }),
 }));

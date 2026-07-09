@@ -1,11 +1,7 @@
-import 'dotenv/config';
-import { GoogleGenAI } from "@google/genai";
+require('dotenv').config();
+const { GoogleGenAI } = require("@google/genai");
 
-// Initialize the client
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const modelName = "gemini-2.5-flash";
 
-// UPDATED: Switching to Gemma 3 12B (Instruction Tuned)
-// This is the open-weights model which is often cheaper or free for testing
-const modelName = "gemma-3-12b-it"; 
-
-export { ai, modelName };
+module.exports = { ai, modelName };

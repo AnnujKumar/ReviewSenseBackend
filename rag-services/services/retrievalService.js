@@ -4,11 +4,13 @@ const parseDiff = require("parse-diff");
 const { HuggingFaceInferenceEmbeddings } = require("@langchain/community/embeddings/hf");
 const { getPineconeIndex } = require("../config/pinecone");
 const { db } = require("../config/db");
-const { symbols, edges, repositories } = require("../lib/db/schema"); // ✅ Added repositories
+const { symbols, edges, repositories } = require("../lib/db/schema");
 const { eq, and, inArray, lte, gte } = require("drizzle-orm");
+const { getBlastRadius, getSymbolsByIds } = require("./graphService");
 
 /* ============================================================
-   1️⃣ GENERIC EMBEDDING SEARCH (UNCHANGED)
+   1️⃣ SEMANTIC SEARCH — Q&A PIPELINE (Pinecone + Graph)
+   Natural Language → Vector Search → 1-hop Graph Neighbors
 ============================================================ */
 async function searchByEmbedding(query, repo, k = 3) {
     try {
@@ -52,9 +54,83 @@ async function searchByEmbedding(query, repo, k = 3) {
     }
 }
 
+/**
+ * Q&A Pipeline: Semantic search + 1-hop graph neighbors
+ * Pinecone finds relevant symbols → Neon DB expands with graph neighbors
+ */
+async function searchByEmbeddingWithGraph(query, repo, repositoryId, k = 5) {
+    try {
+        // Step 1: Pinecone vector search (Top K)
+        const semanticResults = await searchByEmbedding(query, repo, k);
+
+        if (!semanticResults.length || !repositoryId) {
+            return semanticResults;
+        }
+
+        // Step 2: Resolve Pinecone results to symbol IDs in Neon DB
+        const symbolNames = semanticResults.map(r => r.symbolName).filter(Boolean);
+        if (symbolNames.length === 0) return semanticResults;
+
+        const dbSymbols = await db
+            .select({ id: symbols.id, symbolName: symbols.symbolName })
+            .from(symbols)
+            .where(and(
+                eq(symbols.repositoryId, repositoryId),
+                inArray(symbols.symbolName, symbolNames)
+            ));
+
+        if (dbSymbols.length === 0) return semanticResults;
+
+        // Step 3: Find 1-hop neighbors via graph edges
+        const symbolIds = dbSymbols.map(s => s.id);
+
+        const neighborEdges = await db
+            .select({
+                toId: edges.toSymbolId,
+                fromId: edges.fromSymbolId
+            })
+            .from(edges)
+            .where(and(
+                eq(edges.repositoryId, repositoryId),
+                inArray(edges.fromSymbolId, symbolIds)
+            ));
+
+        const neighborIds = new Set();
+        neighborEdges.forEach(e => {
+            neighborIds.add(e.toId);
+            neighborIds.add(e.fromId);
+        });
+        // Remove already-found symbols
+        symbolIds.forEach(id => neighborIds.delete(id));
+
+        if (neighborIds.size === 0) return semanticResults;
+
+        // Step 4: Fetch neighbor symbol data (including sourceCode)
+        const neighbors = await getSymbolsByIds(Array.from(neighborIds));
+
+        const graphContext = neighbors.map(sym => ({
+            score: 0, // Graph-derived, not semantic
+            file: sym.filePath,
+            symbolName: sym.symbolName,
+            symbolType: sym.symbolType,
+            lineRange: `${sym.startLine}-${sym.endLine}`,
+            codeSnippet: sym.sourceCode || `[Symbol: ${sym.symbolName} at ${sym.filePath}]`,
+            source: 'graph-neighbor'
+        }));
+
+        console.log(`   🔗 Graph expansion: ${graphContext.length} neighbors found`);
+
+        return [...semanticResults, ...graphContext];
+
+    } catch (err) {
+        console.error("❌ Graph-augmented search failed:", err.message);
+        return [];
+    }
+}
+
 /* ============================================================
-   2️⃣ DIFF → CHANGED RANGES (FIXED LOGIC)
-   We extract 'Old File' ranges to match the DB state.
+   2️⃣ DIFF → CHANGED RANGES
+   Extract 'Old File' ranges to match the DB state.
 ============================================================ */
 function extractChangedRanges(diffText) {
     const parsed = parseDiff(diffText);
@@ -64,7 +140,6 @@ function extractChangedRanges(diffText) {
 
         file.chunks.forEach(chunk => {
             // Map the Diff Chunk back to the OLD file coordinates (DB state)
-            // If oldLines is 0 (pure addition), we use oldStart as an anchor
             const start = chunk.oldStart;
             const end = chunk.oldLines > 0 ? (chunk.oldStart + chunk.oldLines - 1) : chunk.oldStart;
             
@@ -92,8 +167,7 @@ async function getImpactedSymbols(repositoryId, filePath, ranges) {
 
     const impacted = [];
 
-    // 🕵️ DEBUG: Check if the file exists in DB at all
-    // This helps us debug if it's a Path Mismatch vs Line Number Mismatch
+    // Check if the file exists in DB at all
     const fileExists = await db.query.symbols.findFirst({
         where: and(
             eq(symbols.repositoryId, repositoryId),
@@ -103,7 +177,7 @@ async function getImpactedSymbols(repositoryId, filePath, ranges) {
 
     if (!fileExists) {
         console.warn(`   ⚠️ File not found in DB: ${filePath} (RepoID: ${repositoryId})`);
-        return []; // Skip if file is missing (e.g. new file)
+        return [];
     }
 
     // Check each range for OVERLAP with DB symbols
@@ -131,74 +205,16 @@ async function getImpactedSymbols(repositoryId, filePath, ranges) {
 }
 
 /* ============================================================
-   4️⃣ GRAPH EXPANSION (UNCHANGED)
+   4️⃣ MAIN DIFF-AWARE IMPACT RETRIEVAL (DETERMINISTIC)
+   PR Review Pipeline: Diff → AST → Neon DB Recursive CTE
+   → Fetch source_code directly from Neon DB
+   → BYPASS PINECONE ENTIRELY
 ============================================================ */
-async function expandImpact(repositoryId, baseSymbols) {
-    if (!baseSymbols.length) return [];
-
-    const symbolIds = baseSymbols.map(s => s.id);
-
-    const outgoingEdges = await db.query.edges.findMany({
-        where: and(
-            eq(edges.repositoryId, repositoryId),
-            inArray(edges.fromSymbolId, symbolIds)
-        )
-    });
-
-    if (!outgoingEdges.length) return baseSymbols;
-
-    const impactedIds = outgoingEdges.map(e => e.toSymbolId);
-
-    const impactedSymbols = await db.query.symbols.findMany({
-        where: and(
-            eq(symbols.repositoryId, repositoryId),
-            inArray(symbols.id, impactedIds)
-        )
-    });
-
-    return [...baseSymbols, ...impactedSymbols];
-}
-
-/* ============================================================
-   5️⃣ RETRIEVE IMPACT CONTEXT (UNCHANGED)
-============================================================ */
-async function fetchSymbolsFromPinecone(repo, symbolList) {
-    const index = await getPineconeIndex();
-    if (!index) return [];
-
-    const symbolNames = symbolList.map(s => s.symbolName);
-    if (symbolNames.length === 0) return [];
-
-    const searchResponse = await index.query({
-        vector: Array(768).fill(0),
-        topK: 100, // Fetch plenty of context
-        includeMetadata: true,
-        filter: {
-            repo,
-            symbolName: { "$in": symbolNames }
-        }
-    });
-
-    return searchResponse.matches.map(match => {
-        const meta = match.metadata || {};
-        return {
-            file: meta.path,
-            symbolName: meta.symbolName,
-            symbolType: meta.symbolType,
-            lineRange: `${meta.startLine}-${meta.endLine}`,
-            codeSnippet: meta.text
-        };
-    });
-}
-
-/* ============================================================
-   6️⃣ MAIN DIFF-AWARE IMPACT RETRIEVAL (ROBUST)
-============================================================ */
-async function retrieveImpactContext(diffText, repositoryId, owner, repo) {
+async function retrieveImpactContext(diffText, repositoryId, owner, repo, pullRequestId = null) {
     try {
-        console.log("🧐 Starting diff-aware impact retrieval...");
+        console.log("🧐 Starting deterministic diff-aware impact retrieval...");
 
-        // 🚨 AUTO-FIX: If repositoryId is missing, look it up!
+        // AUTO-FIX: If repositoryId is missing, look it up
         if (!repositoryId) {
             console.log("   ⚠️ repositoryId not provided. Looking up in DB...");
             const repoRecord = await db.query.repositories.findFirst({
@@ -216,7 +232,7 @@ async function retrieveImpactContext(diffText, repositoryId, owner, repo) {
             }
         }
 
-        // 1. Get Ranges based on OLD file coordinates
+        // Step 1: Get ranges based on OLD file coordinates
         const fileRanges = extractChangedRanges(diffText);
         
         let allBaseSymbols = [];
@@ -224,13 +240,13 @@ async function retrieveImpactContext(diffText, repositoryId, owner, repo) {
         for (const file of fileRanges) {
             console.log(`   Checking impact for ${file.filePath} (Ranges: ${JSON.stringify(file.ranges)})`);
             
-            const symbols = await getImpactedSymbols(
+            const impacted = await getImpactedSymbols(
                 repositoryId,
                 file.filePath,
                 file.ranges
             );
 
-            allBaseSymbols.push(...symbols);
+            allBaseSymbols.push(...impacted);
         }
 
         if (!allBaseSymbols.length) {
@@ -238,21 +254,45 @@ async function retrieveImpactContext(diffText, repositoryId, owner, repo) {
             return [];
         }
 
-        // 2. Expand Graph
-        const expandedSymbols = await expandImpact(
-            repositoryId,
-            allBaseSymbols
-        );
+        console.log(`   📍 Found ${allBaseSymbols.length} directly impacted symbols`);
 
-        // 3. Fetch Content
-        const pineconeResults = await fetchSymbolsFromPinecone(
-            `${owner}/${repo}`,
-            expandedSymbols
-        );
+        // Step 2: Calculate Blast Radius via Recursive CTE (2-hop bounded)
+        const targetIds = allBaseSymbols.map(s => s.id);
+        const blastResults = await getBlastRadius(repositoryId, pullRequestId, targetIds);
 
-        console.log(`✅ Retrieved ${pineconeResults.length} impacted contexts.`);
+        // Collect all unique symbol IDs from the blast radius
+        const allImpactedIds = new Set(targetIds); // Start with directly impacted
+        blastResults.forEach(row => {
+            allImpactedIds.add(row.from_symbol);
+            if (row.to_symbol) allImpactedIds.add(row.to_symbol);
+        });
+
+        // Step 3: Fetch source_code DIRECTLY from Neon DB (BYPASS PINECONE)
+        const allSymbols = await getSymbolsByIds(Array.from(allImpactedIds), pullRequestId);
+
+        const impactContext = allSymbols.map(sym => ({
+            file: sym.filePath,
+            symbolName: sym.symbolName,
+            symbolType: sym.symbolType,
+            lineRange: `${sym.startLine}-${sym.endLine}`,
+            codeSnippet: sym.sourceCode || `[No source stored for ${sym.symbolName}]`,
+            hopDepth: targetIds.includes(sym.id) ? 0 : 
+                      (blastResults.find(r => r.from_symbol === sym.id)?.hop_depth || 'unknown')
+        }));
+
+        console.log(`✅ Retrieved ${impactContext.length} total contexts (deterministic, no Pinecone).`);
         
-        return pineconeResults;
+        // 1. Get the list of files the developer actually modified in the PR
+        const prFiles = fileRanges.map(f => f.filePath);
+        
+        // 2. THE CRITICAL FILTER: Remove PR files from the downstream context
+        const trueDownstreamContext = impactContext.filter(sym => 
+            !prFiles.includes(sym.file)
+        );
+        
+        console.log(`✅ Filtered to ${trueDownstreamContext.length} true downstream contexts (excluding PR files).`);
+        
+        return trueDownstreamContext;
 
     } catch (err) {
         console.error("❌ Impact retrieval failed:", err.message);
@@ -262,5 +302,6 @@ async function retrieveImpactContext(diffText, repositoryId, owner, repo) {
 
 module.exports = {
     searchByEmbedding,
+    searchByEmbeddingWithGraph,
     retrieveImpactContext
 };

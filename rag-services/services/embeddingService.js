@@ -6,11 +6,13 @@ const traverse = require("@babel/traverse").default;
 const { HuggingFaceInferenceEmbeddings } = require("@langchain/community/embeddings/hf");
 const { getPineconeIndex } = require("../config/pinecone");
 
-// ✅ CHANGED: We import the split functions to enable the 2-Phase Fix
 const { insertFileSymbols, insertFileEdges, deleteGraphForFile } = require('./graphService');
 
 // =========================================================================
-// 🔒 NO CHANGES MADE TO THIS FUNCTION (As requested)
+// 🔒 PHASE 1: DETERMINISTIC AST SYMBOL & DEPENDENCY EXTRACTION
+//    - No anonymous functions (ArrowFn only if VariableDeclarator)
+//    - ClassMethod namespaced as ClassName.methodName
+//    - Dependencies filtered via Phase-1-derived whitelist
 // =========================================================================
 function extractSymbolsAndDependencies(code, filePath) {
     const symbols = [];
@@ -37,20 +39,19 @@ function extractSymbolsAndDependencies(code, filePath) {
             : null;
     }
 
-    function generateAnonymousName(loc) {
-        return `${filePath}:${loc.start.line}`;
-    }
-
     traverse(ast, {
 
         /* =============================
-           SYMBOL EXTRACTION
+           SYMBOL EXTRACTION (Fixed)
         ============================= */
 
         FunctionDeclaration: {
             enter(path) {
+                // Skip anonymous function declarations entirely
+                if (!path.node.id?.name) return;
+
                 const { start, end, loc } = path.node;
-                const name = path.node.id?.name || generateAnonymousName(loc);
+                const name = path.node.id.name;
 
                 const symbol = {
                     type: "function",
@@ -63,20 +64,20 @@ function extractSymbolsAndDependencies(code, filePath) {
                 symbols.push(symbol);
                 symbolStack.push(name);
             },
-            exit() {
-                symbolStack.pop();
+            exit(path) {
+                if (path.node.id?.name) symbolStack.pop();
             }
         },
 
         FunctionExpression: {
             enter(path) {
+                // Only extract named variable-assigned function expressions
+                // e.g., const myFunc = function() {}
+                if (path.parent.type !== 'VariableDeclarator' || !path.parent.id?.name) return;
                 if (!path.node.loc) return;
 
                 const { start, end, loc } = path.node;
-
-                const name =
-                    path.parent.id?.name ||
-                    generateAnonymousName(loc);
+                const name = path.parent.id.name;
 
                 const symbol = {
                     type: "function_expression",
@@ -89,20 +90,22 @@ function extractSymbolsAndDependencies(code, filePath) {
                 symbols.push(symbol);
                 symbolStack.push(name);
             },
-            exit() {
-                symbolStack.pop();
+            exit(path) {
+                if (path.parent.type === 'VariableDeclarator' && path.parent.id?.name) {
+                    symbolStack.pop();
+                }
             }
         },
 
         ArrowFunctionExpression: {
             enter(path) {
+                // FIX: Only extract if part of a VariableDeclarator
+                // e.g., const myFunc = () => {} — NOT .map(x => x) or Express callbacks
+                if (path.parent.type !== 'VariableDeclarator' || !path.parent.id?.name) return;
                 if (!path.node.loc) return;
 
                 const { start, end, loc } = path.node;
-
-                const name =
-                    path.parent.id?.name ||
-                    generateAnonymousName(loc);
+                const name = path.parent.id.name;
 
                 const symbol = {
                     type: "arrow_function",
@@ -115,15 +118,20 @@ function extractSymbolsAndDependencies(code, filePath) {
                 symbols.push(symbol);
                 symbolStack.push(name);
             },
-            exit() {
-                symbolStack.pop();
+            exit(path) {
+                if (path.parent.type === 'VariableDeclarator' && path.parent.id?.name) {
+                    symbolStack.pop();
+                }
             }
         },
 
         ClassDeclaration: {
             enter(path) {
+                // Skip anonymous class declarations
+                if (!path.node.id?.name) return;
+
                 const { start, end, loc } = path.node;
-                const name = path.node.id?.name || generateAnonymousName(loc);
+                const name = path.node.id.name;
 
                 const symbol = {
                     type: "class",
@@ -136,36 +144,44 @@ function extractSymbolsAndDependencies(code, filePath) {
                 symbols.push(symbol);
                 symbolStack.push(name);
             },
-            exit() {
-                symbolStack.pop();
+            exit(path) {
+                if (path.node.id?.name) symbolStack.pop();
             }
         },
 
         ClassMethod: {
             enter(path) {
+                if (!path.node.key?.name) return;
+
                 const { start, end, loc } = path.node;
-                const name =
-                    path.node.key?.name ||
-                    generateAnonymousName(loc);
+                const methodName = path.node.key.name;
+
+                // FIX: Namespace as ClassName.methodName to avoid collisions
+                const parentClassPath = path.findParent((p) => p.isClassDeclaration());
+                let finalSymbolName = methodName;
+                if (parentClassPath && parentClassPath.node.id) {
+                    finalSymbolName = `${parentClassPath.node.id.name}.${methodName}`;
+                }
 
                 const symbol = {
                     type: "method",
-                    name,
+                    name: finalSymbolName,
                     startLine: loc.start.line,
                     endLine: loc.end.line,
                     code: code.slice(start, end)
                 };
 
                 symbols.push(symbol);
-                symbolStack.push(name);
+                symbolStack.push(finalSymbolName);
             },
-            exit() {
-                symbolStack.pop();
+            exit(path) {
+                if (path.node.key?.name) symbolStack.pop();
             }
         },
 
         /* =============================
            DEPENDENCY EXTRACTION
+           (Raw — filtered later via whitelist)
         ============================= */
 
         CallExpression(path) {
@@ -227,7 +243,25 @@ function extractSymbolsAndDependencies(code, filePath) {
 }
 
 // =========================================================================
-// ✅ UPDATED: Main Ingestion Function (3-Phase Pipeline)
+// 🔒 PHASE 2: WHITELIST-BASED DEPENDENCY FILTERING
+//    Only keep edges whose callee exists in the repository symbol set.
+//    Drops console.log, axios.get, [].push, etc.
+// =========================================================================
+function filterDependenciesByWhitelist(dependencies, symbolWhitelist) {
+    return dependencies.filter(dep => {
+        // Always keep import edges (file-level dependencies)
+        if (dep.type === 'imports') return true;
+
+        // For 'calls' edges, only keep if the callee is a known repo symbol
+        return symbolWhitelist.has(dep.to);
+    });
+}
+
+// =========================================================================
+// ✅ MAIN INGESTION PIPELINE (3-Phase: AST → Graph → Embedding)
+//    - AST IS the chunker — no RecursiveCharacterTextSplitter
+//    - sourceCode stored in Neon DB alongside graph
+//    - Pinecone gets exact semantic blocks
 // =========================================================================
 async function processAndStore(filesArray, repositoryId, owner, repo) {
     console.log(`⚙️  Starting AST-Based (Babel) RAG Pipeline for ${owner}/${repo}...`);
@@ -246,7 +280,24 @@ async function processAndStore(filesArray, repositoryId, owner, repo) {
         }
 
         // ----------------------------------------------------
+        // BUILD WHITELIST: O(1) lookup set of all repo symbols
+        // ----------------------------------------------------
+        const symbolWhitelist = new Set();
+        for (const item of processedFiles) {
+            for (const sym of item.symbols) {
+                symbolWhitelist.add(sym.name);
+            }
+        }
+        console.log(`   🔑 Whitelist built: ${symbolWhitelist.size} repository symbols`);
+
+        // Filter dependencies through the whitelist
+        for (const item of processedFiles) {
+            item.dependencies = filterDependenciesByWhitelist(item.dependencies, symbolWhitelist);
+        }
+
+        // ----------------------------------------------------
         // PHASE 1: CLEAN & INSERT SYMBOLS (The Foundation)
+        // Now includes sourceCode for monolithic storage
         // ----------------------------------------------------
         console.log("   🔹 Phase 1: Symbol Ingestion...");
         for (const item of processedFiles) {
@@ -256,6 +307,7 @@ async function processAndStore(filesArray, repositoryId, owner, repo) {
 
         // ----------------------------------------------------
         // PHASE 2: RESOLVE & INSERT EDGES (The Connections)
+        // Only whitelisted edges survive
         // ----------------------------------------------------
         console.log("   🔹 Phase 2: Edge Resolution...");
         for (const item of processedFiles) {
@@ -264,6 +316,7 @@ async function processAndStore(filesArray, repositoryId, owner, repo) {
 
         // ----------------------------------------------------
         // PHASE 3: EMBEDDING & PINECONE (The Search Index)
+        // AST IS the chunker — each symbol.code is exactly one chunk
         // ----------------------------------------------------
         console.log("   🔹 Phase 3: Embedding Generation...");
 
@@ -275,14 +328,11 @@ async function processAndStore(filesArray, repositoryId, owner, repo) {
 
         const allVectors = [];
 
-        for (const file of processedFiles) { // Using processedFiles which has symbols attached
+        for (const file of processedFiles) {
             console.log(`   📄 Processing Embeddings: ${file.path}`);
             
-            // Note: 'file.symbols' is already attached from Pre-processing step above
-            const symbols = file.symbols; 
-
-            const fileSymbols = symbols.length > 0
-                ? symbols
+            const fileSymbols = file.symbols.length > 0
+                ? file.symbols
                 : [{
                     type: "file",
                     name: file.path,
@@ -297,6 +347,7 @@ async function processAndStore(filesArray, repositoryId, owner, repo) {
 
             if (validSymbols.length === 0) continue;
 
+            // AST IS the chunker: each symbol's code is exactly one chunk
             const texts = validSymbols.map(s => s.code);
 
             // Batch embed to avoid API limits
@@ -348,4 +399,4 @@ async function processAndStore(filesArray, repositoryId, owner, repo) {
     }
 }
 
-module.exports = { processAndStore };
+module.exports = { processAndStore, extractSymbolsAndDependencies, filterDependenciesByWhitelist };
